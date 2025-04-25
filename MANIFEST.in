@@ -1,4 +1,5 @@
-include paramlake/default_config.yaml
-include README.md
 include LICENSE
-include PROJECT_STRUCTURE.md 
+include README.md
+include PROJECT_STRUCTURE.md
+include paramlake/default_config.yaml
+recursive-include examples *.py 
