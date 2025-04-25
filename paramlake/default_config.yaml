@@ -1,0 +1,34 @@
+# Basic options
+output_path: "paramlake_data.zarr"
+run_id: null  # If null, will generate a timestamp-based ID
+capture_frequency: 1  # Capture every N steps/epochs
+capture_gradients: true
+capture_weights: true
+capture_non_trainable: true
+capture_activations: true
+
+adaptive_collection: true
+memory_threshold: 80  # Reduce collection when memory usage exceeds 80%
+memory_check_interval: 10  # Check memory every 10 seconds
+
+# Layer filtering
+include_layers: null  # null means include all
+exclude_layers: null  # null means exclude none
+include_types: null   # null means include all types
+
+# Compression options
+compression:
+  algorithm: "blosc_zstd"  # Options: blosc_zstd, blosc_lz4, zstd, none
+  level: 9  # Compression level (1-9, higher is more compression but slower)
+  shuffle: false  # Whether to shuffle data before compression (improves compression)
+
+# Chunking strategy
+chunking:
+  time_dimension: 1  # Number of timesteps per chunk
+  spatial_dimensions: "auto"  # "auto" or specific dimensions
+  target_chunk_size: 1048576  # 1MB target chunk size
+
+# Activation capture options (only used if capture_activations is true)
+activations:
+  sample_batch: null  # Path to sample input batch file (e.g., .npy file)
+  sample_batch_size: 10  # Number of samples to use if generating synthetic input 

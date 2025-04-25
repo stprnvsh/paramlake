@@ -1,0 +1,143 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.env/
+.venv/
+env.bak/
+venv.bak/
+.python-version
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDEs and editors
+# VSCode
+.vscode/
+.history
+*.code-workspace
+
+# PyCharm
+.idea/
+.idea_modules/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Specific to ParamLake
+# Data files and caches
+*.zarr/
+*.zarr.zip
+*.zarr.archive
+*.h5
+*.hdf5
+*.sqlite
+*.db
+*.icechunk
+model_data/
+dataset_cache/
+
+# Config files (except defaults)
+config/*.yaml
+config/*.yml
+!default_config*.yaml
+!default_config*.yml
+
+# Log files
+logs/
+*.log
+*.log.*
+events.out.tfevents.*
+tensorboard/
+
+# Experiment-specific files
+runs/
+checkpoints/
+outputs/
+results/
+metrics/
+params/
+models/
+
+# Plot output files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+
+# TensorFlow specific
+saved_model/
+*.pb
+graph_def/
+*.ckpt
+*.ckpt.*
+*.meta
+*.index
+*.data-*
+*.profile-empty
+*.tfl
+*.tflite
+
+# Temporary and backup files
+*.bak
+*.tmp
+*.temp
+*.swp
+.*.swp
+*~.nib
+
+# Coverage reports
+.coverage
+htmlcov/
+.coverage.*
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover 

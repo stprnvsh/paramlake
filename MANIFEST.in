@@ -1,0 +1,4 @@
+include paramlake/default_config.yaml
+include README.md
+include LICENSE
+include PROJECT_STRUCTURE.md 

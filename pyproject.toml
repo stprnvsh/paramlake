@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paramlake"
+version = "0.1.0"
+description = "A comprehensive parameter tracking and storage system for TensorFlow models using Zarr"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "ParamLake Team"}
+]
+dependencies = [
+    "tensorflow>=2.6.0",
+    "zarr>=2.12.0",
+    "numcodecs>=0.10.0",
+    "pyyaml>=6.0",
+    "numpy>=1.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "isort>=5.10.0",
+    "mypy>=0.950",
+]
+visualize = [
+    "matplotlib>=3.5.0",
+    "seaborn>=0.11.0",
+]
+
+[tool.setuptools]
+packages = ["paramlake"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true 
