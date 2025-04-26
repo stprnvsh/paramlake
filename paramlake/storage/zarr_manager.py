@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import zarr
-from numcodecs import Blosc, Zstd
+from numcodecs import Zstd
+from zarr.codecs import Blosc
 
 from paramlake.utils.config import ParamLakeConfig
 from paramlake.storage.storage_interface import StorageInterface
@@ -131,14 +132,15 @@ class ZarrStorageManager(StorageInterface):
         if algorithm.startswith("blosc"):
             # Extract blosc variant if specified, use lz4 by default
             cname = algorithm.split("_")[1] if "_" in algorithm else "lz4"
-            return Blosc(cname=cname, clevel=level, shuffle=shuffle)
+            shuffle_mode = 1 if shuffle else 0
+            return Blosc(cname=cname, clevel=level, shuffle=shuffle_mode)
         elif algorithm == "zstd":
             return Zstd(level=level)
         elif algorithm == "none" or algorithm is None:
             return None
         else:
             # Default to blosc with lz4
-            return Blosc(cname="lz4", clevel=level, shuffle=shuffle)
+            return Blosc(cname="lz4", clevel=level, shuffle=1 if shuffle else 0)
     
     def _check_memory_usage(self) -> float:
         """
