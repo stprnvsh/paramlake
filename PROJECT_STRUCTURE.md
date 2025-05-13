@@ -14,6 +14,7 @@ paramlake/
 │   │   ├── weight_collector.py     # Collect weights and parameters
 │   │   ├── gradient_collector.py   # Collect gradients during training
 │   │   └── activation_collector.py # Collect layer activations
+│   │   └── optimizer_collector.py  # Collect optimizer state and configuration
 │   ├── decorators/            # Decorator implementation
 │   │   ├── __init__.py        # Package initialization
 │   │   └── model_decorator.py # Main @paramlake decorator
@@ -30,9 +31,12 @@ paramlake/
 │   │   └── icechunk_analyzer.py # Icechunk data analyzer
 │   └── utils/                 # Utility functions
 │       ├── __init__.py        # Package initialization
-│       └── config.py          # Configuration utilities
+│       ├── config.py          # Configuration utilities
+│       ├── model_utils.py     # Model utility functions
+│       └── checkpoint_utils.py # Checkpoint save/load utilities
 ├── examples/                  # Example scripts
-│   └── tensorflow_example.py  # TensorFlow example
+│   ├── tensorflow_example.py  # TensorFlow example
+│   └── checkpoint_example.py  # Example for using checkpoints
 ├── README.md                  # Project README
 ├── LICENSE                    # MIT License
 ├── PROJECT_STRUCTURE.md       # This file
@@ -58,11 +62,18 @@ Collectors are responsible for gathering data from models during training:
   - Automatically selects the best method for the model architecture
   - Implements restoration of original methods post-training
   - Provides diagnostic information about gradient magnitudes
+  - Supports capture_gradients_batch method for more efficient gradient collection
+  - Includes improved support for large sparse gradients
 
 - **Activation Collector**: Captures intermediate layer outputs (activations)
   - Supports multiple neural network architectures (Functional API, Sequential, Subclassed)
   - Can generate sample inputs to capture activations
   - Handles capturing activations from any layer in the model
+
+- **Optimizer Collector**: Captures optimizer state and configuration
+  - Fetches optimizer weights (e.g., momentum, variance estimates)
+  - Retrieves optimizer configuration (e.g., learning rate, hyperparameters)
+  - Ensures configuration is serializable for storage
 
 ### Decorators
 
@@ -92,10 +103,15 @@ Storage components handle efficient storage and retrieval of data:
 - **Storage Interface**: Abstract interface for storage managers, ensuring consistent API
   - Defines methods for creating layer groups, storing tensors, and managing metadata
   - Provides a unified API for different storage backends
+  - Defines methods for storing optimizer state and configuration
+  - Includes methods for checkpoint save/load operations
 
 - **Storage Factory**: Creates appropriate storage manager based on configuration
   - Dynamically selects between Zarr and Icechunk based on configuration
   - Handles fallbacks when optional dependencies are not available
+  - Monitors memory usage for adaptive collection strategies
+  - Provides specialized gradient storage with optimized chunking
+  - Stores optimizer state and configuration
 
 - **Zarr Manager**: Manages writing data to Zarr stores with appropriate chunking and compression
   - Implements optimized chunking strategies for different tensor shapes and tensor types
@@ -103,12 +119,15 @@ Storage components handle efficient storage and retrieval of data:
   - Handles both synchronous and asynchronous writes
   - Monitors memory usage for adaptive collection strategies
   - Provides specialized gradient storage with optimized chunking
+  - Implements checkpoint save/load functionality 
 
 - **Zarr Analyzer**: Provides tools for analyzing and visualizing the stored data
   - Computes statistics on weights, gradients, and activations
   - Generates visualizations of parameter evolution and gradient behavior
   - Supports comparing multiple training runs
   - Implements lazy loading to efficiently handle large datasets
+  - Retrieves and displays optimizer configuration and state
+  - Provides utilities for accessing checkpoints
 
 - **Icechunk Manager**: Manages writing data to Icechunk repositories with transactional semantics
   - Supports cloud storage backends (S3, GCS, Azure)
@@ -116,12 +135,16 @@ Storage components handle efficient storage and retrieval of data:
   - Handles transactions and commits for ensuring data consistency
   - Provides metadata tracking and tagging for model versions
   - Includes gradient-specific storage optimizations
+  - Stores optimizer state and configuration
+  - Integrates checkpoints with Icechunk's native snapshot system
 
 - **Icechunk Analyzer**: Provides tools for analyzing data stored in Icechunk repositories
   - Supports efficient querying of model histories and snapshots
   - Generates visualizations of parameter and gradient evolution
   - Enables comparisons between different snapshots and training runs
   - Implements analysis of gradient statistics across model layers
+  - Retrieves and displays optimizer configuration and state
+  - Provides access to checkpoint data in snapshots
 
 ### Utils
 
@@ -133,6 +156,17 @@ Utility functions for configuration and other common tasks:
   - Supports gradient-specific configuration settings
   - Enables specialized compression and chunking for different tensor types
 
+- **Model Utils**: Utility functions for working with TensorFlow models
+  - Provides functions to get all layers, including nested layers
+  - Includes tensor processing batch utilities
+
+- **Checkpoint Utils**: Utilities for saving and loading model checkpoints
+  - Save model weights and optimizer state to storage
+  - Load checkpoints and restore model state
+  - List available checkpoints
+  - Support for continuing training from checkpoints
+  - Integration with both Zarr and Icechunk storage backends
+
 ## Data Flow
 
 1. The user applies the `@paramlake` decorator to a model or training function
@@ -141,8 +175,10 @@ Utility functions for configuration and other common tasks:
    - The weight collector captures layer weights
    - The gradient collector automatically captures gradients using the appropriate method
    - The activation collector captures activations (if enabled)
+   - The optimizer collector captures optimizer state and configuration (if enabled)
 4. All data is stored with optimized chunking and compression
 5. After training, the user can analyze the data using the appropriate analyzer
+6. The user can save checkpoints at any point and later restore them to continue training
 
 ## Configuration Options
 
@@ -150,6 +186,7 @@ Configuration can be provided via YAML files or inline parameters:
 
 - **Basic Options**: Output path, run ID, capture frequency, what to capture
 - **Gradient Options**: Auto tracking, tracking method, specialized storage settings
+- **Optimizer Options**: Enable/disable optimizer state capture
 - **Layer Filtering**: Include/exclude specific layers or layer types
 - **Compression**: Algorithm, level, and tensor-type specific compression settings
 - **Chunking**: How to chunk the data for efficient storage and retrieval
@@ -168,4 +205,6 @@ Configuration can be provided via YAML files or inline parameters:
 - **Framework Compatibility**: Core schema designed to support TensorFlow, PyTorch, and JAX
 - **Efficient Data Analysis**: Lazy loading and caching for efficient analysis of large datasets
 - **Gradient Analysis Tools**: Built-in support for analyzing and visualizing gradient behavior
-- **Version Control**: History tracking and snapshot management with Icechunk 
+- **Optimizer Analysis Tools**: Support for retrieving and inspecting optimizer state and configuration
+- **Version Control**: History tracking and snapshot management with Icechunk
+- **Checkpointing System**: Save and restore training state to continue from specific points in training 
