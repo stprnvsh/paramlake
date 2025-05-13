@@ -6,13 +6,15 @@ A comprehensive solution for tracking, storing, and analyzing deep learning mode
 
 - **Minimal Code Changes**: Simply add a decorator to your training function
 - **Automatic Gradient Capture**: Multiple methods for tracking gradients without manual instrumentation
-- **Comprehensive Data Collection**: Capture trainable weights, non-trainable variables, gradients, and activations
+- **Comprehensive Data Collection**: Capture trainable weights, non-trainable variables, gradients, activations, and optimizer states (including configuration).
 - **Optimized Storage**: Specialized chunk sizes and compression strategies for different tensor types
-- **Efficient Analysis**: Tools for analyzing and visualizing model parameters and gradients
+- **Efficient Analysis**: Tools for analyzing and visualizing model parameters, gradients, and optimizer states.
 - **Transactional Storage**: Supports Icechunk for cloud-native transactional tensor storage
 - **Framework Agnostic Design**: Core schema designed to work across TensorFlow, PyTorch, and JAX (TensorFlow implementation provided)
 - **Flexible Configuration**: YAML-based configuration for customizing what and how data is collected
 - **Production Ready**: Optimized for minimal training overhead while providing comprehensive parameter tracking
+- **Checkpointing**: Save and restore model weights and optimizer states to resume training from specific points
+- **Version Control for AI Models**: Like Git for AI models - save snapshots of your model and restore to any point in training history
 
 ## Installation
 
@@ -44,9 +46,10 @@ from paramlake import paramlake
 #   enabled: true
 #   auto_tracking: true
 #   track_method: "auto"  # Can be "auto", "train_step", "optimizer", or "callback"
+# capture_optimizer_state: true # Enable optimizer state capture
 
 # 2. Add the decorator to your training function
-@paramlake(config="config.yaml")  # or inline config: @paramlake(capture_frequency=5)
+@paramlake(config="config.yaml")  # or inline config: @paramlake(capture_frequency=5, capture_optimizer_state=True)
 def train_model():
     # Define and train your model as usual
     model = tf.keras.Sequential([...])
@@ -66,7 +69,86 @@ analyzer.plot_weight_evolution("dense_1/kernel")
 analyzer.plot_gradient_norm_by_layer()
 gradient_stats = analyzer.analyze_gradient_statistics()
 print(f"Gradient coverage: {gradient_stats['summary']['gradient_coverage']:.2%}")
+
+# 6. Analyze optimizer state (if captured)
+optimizer_config = analyzer.get_optimizer_config()
+if optimizer_config:
+    print(f"Optimizer Config: {optimizer_config}")
+optimizer_state_step_0 = analyzer.get_optimizer_state(step=0)
+if optimizer_state_step_0:
+    print(f"Optimizer state at step 0: {len(optimizer_state_step_0)} tensors")
 ```
+
+## Checkpointing and Model Versioning
+
+ParamLake provides Git-like functionality for AI models, allowing you to save checkpoints and resume training from any point:
+
+```python
+import tensorflow as tf
+from paramlake import save_checkpoint, load_checkpoint, list_checkpoints
+from paramlake.storage.factory import create_storage_manager
+from paramlake.utils.config import ParamLakeConfig
+
+# 1. Create a model and train it for a few epochs
+model = tf.keras.Sequential([...])
+model.compile(optimizer='adam', loss='mse')
+model.fit(x_train, y_train, epochs=5)
+
+# 2. Create a storage manager
+config = ParamLakeConfig({
+    "output_path": "model_checkpoints.zarr",
+    "run_id": "my_training_run"
+})
+storage = create_storage_manager(config)
+
+# 3. Save a checkpoint after initial training
+checkpoint_id = save_checkpoint(
+    model=model,
+    storage_manager=storage,
+    step=5,
+    name="initial_training",
+    description="Model after 5 epochs"
+)
+print(f"Saved checkpoint: {checkpoint_id}")
+
+# 4. Train the model further
+model.fit(x_train, y_train, epochs=5, initial_epoch=5)
+
+# 5. Save another checkpoint
+checkpoint_id_2 = save_checkpoint(
+    model=model,
+    storage_manager=storage,
+    step=10,
+    name="continued_training",
+    description="Model after 10 epochs"
+)
+
+# 6. List all available checkpoints
+checkpoints = list_checkpoints(storage)
+for i, checkpoint in enumerate(checkpoints):
+    print(f"Checkpoint {i+1}:")
+    print(f"  ID: {checkpoint.get('id')}")
+    print(f"  Name: {checkpoint.get('name')}")
+    print(f"  Step: {checkpoint.get('step')}")
+
+# 7. Create a new model and restore from a checkpoint
+new_model = tf.keras.Sequential([...])
+new_model.compile(optimizer='adam', loss='mse')  # Same architecture required
+
+# 8. Load weights and optimizer state from checkpoint
+metadata = load_checkpoint(
+    model=new_model,
+    storage_manager=storage,
+    checkpoint_id=checkpoint_id,  # Can also use step=5 to load by step number
+    include_optimizer=True,
+    recompile=True
+)
+
+# 9. Continue training from where you left off
+new_model.fit(x_train, y_train, epochs=5, initial_epoch=5)
+```
+
+With IceChunk storage, checkpoints are integrated with snapshot functionality for seamless version control of model training.
 
 ## Automatic Gradient Capture
 
@@ -113,6 +195,7 @@ output_path: "model_data.zarr"  # Where to store the dataset
 capture_frequency: 5  # Capture every 5 steps/epochs
 capture_gradients: true  # Whether to capture gradients
 capture_activations: false  # Whether to capture activations
+capture_optimizer_state: true # Whether to capture optimizer state and configuration
 
 # Gradient options
 gradients:
@@ -197,6 +280,11 @@ analyzer = IcechunkModelAnalyzer({
 analyzer.plot_weight_evolution("dense/kernel")
 analyzer.plot_gradient_norm_by_layer()
 gradient_stats = analyzer.analyze_gradient_statistics()
+
+# Analyze optimizer state with Icechunk
+optimizer_config = analyzer.get_optimizer_config()
+if optimizer_config:
+    print(f"Optimizer Config for snapshot {analyzer.snapshot_id}: {optimizer_config}")
 ```
 
 ## Analyzing the Data
@@ -228,6 +316,17 @@ analyzer.plot_gradient_norm_by_layer()
 
 # Compare two training runs
 analyzer.compare_runs("run1.zarr", "run2.zarr")
+
+# Retrieve optimizer configuration and state
+optimizer_config = analyzer.get_optimizer_config()
+if optimizer_config:
+    print(f"Optimizer Configuration: {optimizer_config}")
+
+# Get optimizer state for a specific step (e.g., step 10)
+optimizer_state_step_10 = analyzer.get_optimizer_state(step=10)
+if optimizer_state_step_10:
+    print(f"Optimizer has {len(optimizer_state_step_10)} state tensors at step 10.")
+    # You can then inspect individual tensors: optimizer_state_step_10[0]
 ```
 
 For Icechunk storage, use the IcechunkModelAnalyzer:
@@ -262,6 +361,11 @@ for snapshot in history[:3]:  # Look at the latest 3 snapshots
     # Get gradient statistics
     grad_stats = temp_analyzer.analyze_gradient_statistics()
     print(f"Snapshot {snapshot['id']}: Gradient coverage {grad_stats['summary']['gradient_coverage']:.2%}")
+    
+    # Get optimizer config for this snapshot
+    opt_config_snap = temp_analyzer.get_optimizer_config()
+    if opt_config_snap:
+        print(f"Snapshot {snapshot['id']}: Optimizer Config: {opt_config_snap}")
 ```
 
 ## Extensibility

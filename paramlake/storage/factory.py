@@ -26,14 +26,30 @@ def create_storage_manager(config: ParamLakeConfig) -> StorageInterface:
     """
     storage_type = config.get("storage_type", "zarr")
     
+    # Enable verbose mode for debugging
+    # Create a copy of the config with verbose enabled
+    config_dict = config.to_dict()
+    if not config_dict.get("verbose", False):
+        config_dict["verbose"] = True
+        # Update the config object with the modified dictionary
+        config = ParamLakeConfig(config_dict)
+        
+    print(f"Creating storage manager of type: {storage_type}")
+    
     if storage_type == "icechunk":
         if not HAS_ICECHUNK:
             raise ImportError("Icechunk storage requested but icechunk is not installed. "
                              "Install it with 'pip install icechunk'")
-        return IcechunkStorageManager(config)
+        print("Creating IcechunkStorageManager")
+        manager = IcechunkStorageManager(config)
+        print(f"Created IcechunkStorageManager with run_id: {manager.run_id}")
+        return manager
     else:
         # Default to Zarr
-        return ZarrStorageManager(config)
+        print("Creating ZarrStorageManager")
+        manager = ZarrStorageManager(config)
+        print(f"Created ZarrStorageManager with run_id: {manager.run_id}")
+        return manager
 
 
 def get_storage_manager_class(storage_type: str) -> type:

@@ -149,33 +149,64 @@ class GradientCollector:
                         tensor_name = tensor_name.split(":")[0]
                     self._var_to_layer_map[var_name] = (layer_name, tensor_name)
         
-        # Process each gradient
-        for grad, var in zip(gradients, variables):
-            if grad is None:
-                # Skip variables with no gradient
+        # Track if any gradients were successfully stored
+        gradients_stored = False
+        
+        # CRITICAL FIX: Map all variables by their full layer names to avoid conflicts
+        layer_variables_map = {}
+        
+        # Group variables by their layer name to ensure we create proper layer groups
+        for var_idx, var in enumerate(variables):
+            if gradients[var_idx] is None:
                 continue
-                
-            var_name = var.name
             
-            if var_name in self._var_to_layer_map:
-                layer_name, tensor_name = self._var_to_layer_map[var_name]
+            var_name = var.name
+            if ":" in var_name:
+                var_name = var_name.split(":")[0]
+            
+            # Extract full layer name and tensor name
+            parts = var_name.split("/")
+            
+            # Initialize layer_name to a default value to avoid the reference error
+            layer_name = "unknown_layer"
+            tensor_name = "unknown_tensor"
+            
+            if len(parts) > 1:
+                # Try to extract proper layer name - fixing the bug
+                layer_name = parts[0]  # Use only the base layer name
+                tensor_name = parts[-1]
+            
+            # Create a unique key for each variable
+            unique_key = var_name.replace("/", "_").replace(":", "_")
+            
+            # Store in map
+            if layer_name not in layer_variables_map:
+                layer_variables_map[layer_name] = []
                 
-                # Get layer type (best guess if not available)
-                layer_type = "Unknown"
-                if "/" in var_name:
-                    # Try to guess layer type from variable name pattern
-                    name_parts = var_name.split("/")
-                    if len(name_parts) > 1:
-                        if "conv" in name_parts[-2].lower():
-                            layer_type = "Conv2D"
-                        elif "dense" in name_parts[-2].lower():
-                            layer_type = "Dense"
-                        elif "batch" in name_parts[-2].lower():
-                            layer_type = "BatchNormalization"
+            layer_variables_map[layer_name].append((var_idx, var, unique_key, tensor_name))
+        
+        # Now process each layer's variables separately to avoid shape conflicts
+        for layer_name, var_entries in layer_variables_map.items():
+            # Determine layer type (best guess)
+            layer_type = "Unknown"
+            if var_entries:
+                var_name = var_entries[0][1].name
+                if "conv" in var_name.lower():
+                    layer_type = "Conv2D"
+                elif "dense" in var_name.lower():
+                    layer_type = "Dense"
+                elif "batch" in var_name.lower():
+                    layer_type = "BatchNormalization"
+            
+            # Get or create layer group
+            try:
+                layer_group = self.storage.create_or_get_layer_group(layer_name, layer_type)
                 
-                try:
-                    # Get or create layer group
-                    layer_group = self.storage.create_or_get_layer_group(layer_name, layer_type)
+                # Process each variable for this layer
+                for var_idx, var, unique_key, tensor_name in var_entries:
+                    grad = gradients[var_idx]
+                    if grad is None:
+                        continue
                     
                     # Convert gradient to numpy array
                     grad_numpy = self._tensor_to_numpy(grad)
@@ -183,19 +214,62 @@ class GradientCollector:
                     # Debug print to verify shape
                     print(f"Storing gradient for {layer_name}/{tensor_name} with shape: {grad_numpy.shape}")
                     
-                    # Store gradient
-                    self.storage.store_tensor(
-                        layer_group,
-                        tensor_name,
-                        "gradients",
-                        grad_numpy,
-                        step
-                    )
-                except Exception as e:
-                    # Print the full exception for better debugging
-                    import traceback
-                    print(f"Error storing gradient {tensor_name} for layer {layer_name}:")
-                    traceback.print_exc()
+                    try:
+                        # Store gradient - use unique_key to avoid conflicts
+                        self.storage.store_tensor(
+                            layer_group,
+                            tensor_name,  # Use standard tensor name (kernel, bias)
+                            "gradients",  # Standard tensor type
+                            grad_numpy,
+                            step
+                        )
+                        
+                        # Mark that we stored at least one gradient
+                        gradients_stored = True
+                    except Exception as e:
+                        import traceback
+                        print(f"Error storing gradient {tensor_name} for layer {layer_name}:")
+                        traceback.print_exc()
+                        
+                        # Try alternate storage approach if there's a shape conflict
+                        try:
+                            if "shape" in str(e) or "ValueError" in str(e):
+                                print(f"Attempting alternate storage for {tensor_name} with shape {grad_numpy.shape}")
+                                
+                                # Create a new unique tensor name to avoid conflicts
+                                new_tensor_name = f"{tensor_name}_{grad_numpy.shape}"
+                                
+                                # Try to store with new name
+                                self.storage.store_tensor(
+                                    layer_group,
+                                    new_tensor_name,
+                                    "gradients",
+                                    grad_numpy,
+                                    step
+                                )
+                                
+                                print(f"Successfully stored with alternate name: {new_tensor_name}")
+                                # Mark that we stored at least one gradient
+                                gradients_stored = True
+                        except Exception as e2:
+                            print(f"Failed alternate storage method too: {e2}")
+            except Exception as e:
+                # Print the full exception for better debugging
+                import traceback
+                print(f"Error processing layer {layer_name}:")
+                traceback.print_exc()
+        
+        # Verify gradients were stored
+        if not gradients_stored:
+            print("WARNING: No gradients were successfully stored!")
+        else:
+            print(f"Successfully stored gradients at step {step}")
+            # Force storage to save immediately
+            try:
+                if hasattr(self.storage, 'flush'):
+                    self.storage.flush()
+            except Exception as e:
+                print(f"Error flushing storage: {e}")
     
     def compute_and_capture_gradients(
         self,

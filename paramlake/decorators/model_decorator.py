@@ -16,6 +16,7 @@ import zarr
 from paramlake.collectors.activation_collector import ActivationCollector
 from paramlake.collectors.gradient_collector import GradientCollector
 from paramlake.collectors.weight_collector import WeightCollector
+from paramlake.collectors.optimizer_collector import OptimizerCollector
 from paramlake.storage.zarr_manager import ZarrStorageManager
 from paramlake.utils.config import ParamLakeConfig
 from paramlake.storage.factory import create_storage_manager
@@ -55,6 +56,7 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
         self.capture_gradients = config.get("gradients", {}).get("enabled", capture_gradients)
         self.auto_gradient_tracking = config.get("gradients", {}).get("auto_tracking", True)
         self.gradient_track_method = config.get("gradients", {}).get("track_method", "auto")
+        self.capture_optimizer_state = config.get("capture_optimizer_state", True)
         
         # Create collectors
         self.weight_collector = WeightCollector(
@@ -79,6 +81,10 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
                 exclude_layers=exclude_layers
             )
         
+        self.optimizer_collector = None
+        if self.capture_optimizer_state:
+            self.optimizer_collector = OptimizerCollector(self.storage_manager)
+        
         self.sample_data = None
         self.current_epoch = 0
         self._model = None  # Store model as a private attribute
@@ -99,6 +105,34 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
     def on_train_begin(self, logs=None):
         # Initialize step counter
         self.storage_manager.set_step(0)
+        
+        # CRITICAL FIX: Create sample data if we don't have it
+        if self.sample_data is None:
+            try:
+                # Try to create a small random batch for gradient computation
+                import numpy as np
+                
+                # Get input shape from model
+                if hasattr(self.model, 'input_shape'):
+                    input_shape = self.model.input_shape
+                    if isinstance(input_shape, tuple) and None in input_shape:
+                        # Replace None (batch dimension) with a small batch size
+                        input_shape = (2,) + input_shape[1:]
+                    elif isinstance(input_shape, list):
+                        # Handle multiple inputs
+                        input_shape = [(2,) + shape[1:] if shape is not None and None in shape else (2,) + shape for shape in input_shape]
+                    
+                    # Create random sample data
+                    if isinstance(input_shape, tuple):
+                        self.sample_data = np.random.normal(0, 1, size=input_shape).astype(np.float32)
+                    elif isinstance(input_shape, list):
+                        self.sample_data = [np.random.normal(0, 1, size=shape).astype(np.float32) for shape in input_shape]
+                    
+                    print(f"Created sample data with shape: {self.sample_data.shape if isinstance(self.sample_data, np.ndarray) else [x.shape for x in self.sample_data]}")
+            except Exception as e:
+                print(f"Warning: Failed to create sample data: {e}")
+                import traceback
+                traceback.print_exc()
         
         # Try to setup activation capture if enabled
         if self.activation_collector and hasattr(self, 'model') and self.model is not None:
@@ -141,13 +175,33 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
                     if self.sample_data is not None and hasattr(self.gradient_collector, 'compute_gradients_with_tape'):
                         try:
                             print("Computing initial gradients with sample data")
-                            self.gradient_collector.compute_gradients_with_tape(
+                            result = self.gradient_collector.compute_gradients_with_tape(
                                 self.model,
                                 self.sample_data,
                                 step=0
                             )
+                            if result is not None:
+                                print("Successfully computed initial gradients")
+                            else:
+                                print("Warning: Initial gradient computation returned None")
                         except Exception as e:
                             print(f"Warning: Failed to compute initial gradients: {e}")
+                
+                    # Explicitly verify that gradient tracking is properly set up
+                    if hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
+                        print(f"Model has optimizer: {self.model.optimizer.__class__.__name__}")
+                        if hasattr(self.model.optimizer, 'apply_gradients'):
+                            print("Optimizer has apply_gradients method")
+                            # Check if it's the original or our wrapped version
+                            if self.gradient_collector._original_apply_gradients is not None:
+                                print("Gradient tracking is active: apply_gradients has been wrapped")
+                            else:
+                                print("Warning: apply_gradients has not been wrapped")
+                        if hasattr(self.model, 'train_step'):
+                            if self.gradient_collector._original_train_step is not None:
+                                print("Gradient tracking is active: train_step has been wrapped")
+                            else:
+                                print("Warning: train_step has not been wrapped")
             except Exception as e:
                 import traceback
                 print(f"Error setting up gradient capture: {e}")
@@ -171,6 +225,39 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
                     else:
                         self.weight_collector.capture_model_weights(self.model, step=epoch)
                     
+                    # CRITICAL FIX: Directly capture gradients if we have sample data
+                    if self.capture_gradients and self.gradient_collector and self.sample_data is not None:
+                        try:
+                            print(f"Explicitly computing gradients at epoch {epoch}")
+                            # Use the sample data to compute gradients
+                            with tf.GradientTape() as tape:
+                                # Forward pass
+                                y_pred = self.model(self.sample_data, training=True)
+                                # Use a simple MSE loss if the model hasn't been compiled
+                                if hasattr(self.model, 'compiled_loss'):
+                                    # Create dummy targets with the same shape as predictions
+                                    dummy_targets = tf.zeros_like(y_pred)
+                                    loss = self.model.compiled_loss(dummy_targets, y_pred)
+                                else:
+                                    # Just use MSE against zeros
+                                    loss = tf.reduce_mean(tf.square(y_pred))
+                        
+                            # Compute gradients
+                            gradients = tape.gradient(loss, self.model.trainable_variables)
+                            
+                            # Capture gradients using our collector
+                            self.gradient_collector.capture_gradients(
+                                gradients, 
+                                self.model.trainable_variables, 
+                                step=epoch
+                            )
+                            
+                            print(f"Successfully captured gradients at epoch {epoch}")
+                        except Exception as e:
+                            import traceback
+                            print(f"Error capturing gradients at epoch {epoch}: {e}")
+                            traceback.print_exc()
+                    
                     # If activation collection is enabled and we have sample data
                     if self.activation_collector and self.sample_data is not None:
                         # Use the batch processing method if available
@@ -178,6 +265,20 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
                             self.activation_collector.capture_activations_batch(self.model, self.sample_data, step=epoch)
                         else:
                             self.activation_collector.capture_activations(self.model, self.sample_data, step=epoch)
+
+                    # Capture optimizer state if enabled
+                    if self.capture_optimizer_state and self.optimizer_collector and hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
+                        try:
+                            # Use the optimizer_collector
+                            self.optimizer_collector.capture_optimizer_state(
+                                self.model.optimizer, 
+                                step=epoch
+                            )
+                        except Exception as e_opt:
+                            import traceback
+                            print(f"Error capturing optimizer state at epoch {epoch}: {e_opt}")
+                            traceback.print_exc()
+                    
                 except Exception as e:
                     import traceback
                     print(f"Error capturing model state at epoch {epoch}: {e}")
@@ -194,6 +295,13 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
                             self.storage_manager.store_metric(name, float(value.item()), step=epoch)
                 except Exception as e:
                     print(f"Error storing metrics at epoch {epoch}: {e}")
+            
+            # CRITICAL FIX: Force storage to commit changes after each epoch
+            if hasattr(self.storage_manager, 'commit_changes') and callable(self.storage_manager.commit_changes):
+                try:
+                    self.storage_manager.commit_changes(f"Commit at epoch {epoch+1}")
+                except Exception as e:
+                    print(f"Warning: Could not commit changes: {e}")
     
     def on_train_batch_end(self, batch, logs=None):
         """
@@ -211,40 +319,59 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
             # If we have auto-tracking enabled, the gradients should already be tracked
             if not self._gradient_tracking_enabled and hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
                 try:
-                    # Try to capture gradients from the optimizer
+                    # Try multiple approaches to capture gradients
+                    gradients_captured = False
+                    
+                    # Approach 1: Try to capture gradients directly from the optimizer
                     if hasattr(self.model.optimizer, '_gradients') and self.model.optimizer._gradients is not None:
                         gradients = self.model.optimizer._gradients
-                        variables = self.model.optimizer._variables
-                        if gradients and variables:
+                        variables = self.model.optimizer._variables if hasattr(self.model.optimizer, '_variables') else self.model.trainable_variables
+                        if gradients and variables and len(gradients) > 0 and len(variables) > 0:
+                            print(f"Capturing {len(gradients)} gradients from optimizer._gradients")
                             self.gradient_collector.capture_gradients(gradients, variables, step=self.current_epoch)
-                            print(f"Successfully captured gradients at epoch {self.current_epoch}")
-                    # Fallback to batch processing methods
-                    elif hasattr(self.gradient_collector, 'capture_optimizer_gradients_batch'):
-                        self.gradient_collector.capture_optimizer_gradients_batch(
+                            gradients_captured = True
+                    
+                    # Approach 2: Try batch processing methods
+                    if not gradients_captured and hasattr(self.gradient_collector, 'capture_optimizer_gradients_batch'):
+                        print("Attempting to capture optimizer gradients using batch method")
+                        success = self.gradient_collector.capture_optimizer_gradients_batch(
                             self.model.optimizer, 
                             step=self.current_epoch
                         )
-                        print(f"Captured optimizer gradients batch at epoch {self.current_epoch}")
-                    elif hasattr(self.gradient_collector, "capture_optimizer_gradients"):
-                        self.gradient_collector.capture_optimizer_gradients(
+                        if success:
+                            print(f"Successfully captured optimizer gradients batch at epoch {self.current_epoch}")
+                            gradients_captured = True
+                    
+                    # Approach 3: Try regular optimizer gradient capture
+                    if not gradients_captured and hasattr(self.gradient_collector, "capture_optimizer_gradients"):
+                        print("Attempting to capture optimizer gradients")
+                        success = self.gradient_collector.capture_optimizer_gradients(
                             self.model.optimizer, 
                             step=self.current_epoch
                         )
-                        print(f"Captured optimizer gradients at epoch {self.current_epoch}")
-                    else:
-                        # Try to force gradient capture using the compute_gradients method if we have sample data
-                        if hasattr(self, 'sample_data') and self.sample_data is not None:
-                            if hasattr(self.gradient_collector, 'compute_gradients_with_tape'):
-                                # Use the sample data to compute gradients with tape
-                                self.gradient_collector.compute_gradients_with_tape(
-                                    self.model,
-                                    self.sample_data,
-                                    step=self.current_epoch
-                                )
-                                print(f"Computed gradients with tape at epoch {self.current_epoch}")
+                        if success:
+                            print(f"Successfully captured optimizer gradients at epoch {self.current_epoch}")
+                            gradients_captured = True
+                    
+                    # Approach 4: As a last resort, try to compute gradients with tape using sample data
+                    if not gradients_captured and hasattr(self, 'sample_data') and self.sample_data is not None:
+                        if hasattr(self.gradient_collector, 'compute_gradients_with_tape'):
+                            print("Attempting to compute gradients using gradient tape")
+                            result = self.gradient_collector.compute_gradients_with_tape(
+                                self.model,
+                                self.sample_data,
+                                step=self.current_epoch
+                            )
+                            if result is not None:
+                                print(f"Successfully computed gradients with tape at epoch {self.current_epoch}")
+                                gradients_captured = True
+                    
+                    if not gradients_captured:
+                        print(f"Warning: Failed to capture gradients at epoch {self.current_epoch}")
+                    
                 except Exception as e:
                     # Just log the error and continue
-                    print(f"Warning: Error capturing gradients from optimizer: {e}")
+                    print(f"Warning: Error capturing gradients at batch end: {e}")
                     import traceback
                     traceback.print_exc()
     
@@ -336,6 +463,10 @@ class ModelWrapper:
             else:
                 self.sample_input = None
         
+        self.optimizer_collector = None
+        if config.get("capture_optimizer_state", True):
+            self.optimizer_collector = OptimizerCollector(self.storage)
+        
         # Create callback
         self.callback = ParamLakeCallback(
             config=config,
@@ -377,42 +508,42 @@ class ModelWrapper:
         Returns:
             Results from the original train_step
         """
-        result = self._original_train_step(data)
+        # Store data for gradient capture
+        x, y = data
+        self.sample_data = x
         
-        # Check if it's time to capture
+        # Use gradient tape to capture gradients directly
+        with tf.GradientTape() as tape:
+            # Forward pass
+            logits = self.model(x, training=True)
+            # Compute loss
+            loss = self.model.compiled_loss(y, logits, regularization_losses=self.model.losses)
+        
+        # Calculate gradients
+        gradients = tape.gradient(loss, self.model.trainable_variables)
+        
+        # Apply gradients with optimizer
+        self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        
+        # Update metrics
+        self.model.compiled_metrics.update_state(y, logits)
+        
+        # Get current step
         step = self.storage.current_step
-        capture_frequency = self.callback.capture_frequency
         
-        if step % capture_frequency == 0:
-            # Capture weights
-            if self.config["capture_weights"]:
-                # Use batch processing method if available
-                if hasattr(self.weight_collector, 'capture_model_weights_batch'):
-                    self.weight_collector.capture_model_weights_batch(self.model, step)
-                else:
-                    self.weight_collector.capture_model_weights(self.model, step)
-            
-            # Capture gradients if available
-            if self.config["capture_gradients"] and hasattr(self.model, "optimizer") and self.model.optimizer is not None:
-                # Use batch processing method if available
-                if hasattr(self.gradient_collector, 'capture_optimizer_gradients_batch'):
-                    self.gradient_collector.capture_optimizer_gradients_batch(self.model.optimizer, step)
-                elif hasattr(self.gradient_collector, "capture_optimizer_gradients"):
-                    self.gradient_collector.capture_optimizer_gradients(self.model.optimizer, step)
-            
-            # Capture activations if enabled and we have sample input
-            if (self.config["capture_activations"] and self.activation_collector 
-                and hasattr(self, "sample_input") and self.sample_input is not None):
-                # Use batch processing method if available
-                if hasattr(self.activation_collector, 'capture_activations_batch'):
-                    self.activation_collector.capture_activations_batch(self.model, self.sample_input, step)
-                else:
-                    self.activation_collector.capture_activations(self.model, self.sample_input, step)
-            
-            # Increment step counter
-            self.storage.increment_step()
+        # Store gradients directly if enabled
+        if self.config["capture_gradients"] and step % self.callback.capture_frequency == 0:
+            # Explicitly store gradients through the gradient collector
+            try:
+                print(f"Directly storing gradients at step {step}")
+                self.gradient_collector.capture_gradients(gradients, self.model.trainable_variables, step)
+            except Exception as e:
+                import traceback
+                print(f"Error directly storing gradients: {e}")
+                traceback.print_exc()
         
-        return result
+        # Return dict with metrics
+        return {m.name: m.result() for m in self.model.metrics}
     
     def __getattr__(self, name):
         """
@@ -582,6 +713,9 @@ def paramlake(func=None, config=None, **kwargs):
             # Get activation capture configuration
             capture_activations = kwargs.pop("capture_activations", 
                                  cfg.get("capture_activations", False))
+            
+            # Get optimizer state capture configuration (not passed as kwarg directly to decorator usually)
+            # It will be read from cfg by the ParamLakeCallback constructor
             
             # Create callback
             callback = ParamLakeCallback(

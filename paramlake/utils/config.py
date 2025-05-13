@@ -35,6 +35,7 @@ class ParamLakeConfig:
         "capture_weights": True,
         "capture_non_trainable": True,
         "capture_activations": False,
+        "capture_optimizer_state": True,  # Added new option
         
         # Layer filtering
         "include_layers": None,  # None means include all

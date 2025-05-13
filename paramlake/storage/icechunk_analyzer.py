@@ -215,12 +215,35 @@ class IcechunkModelAnalyzer:
         info = dict(layer_group.attrs)
         
         # Add tensor types and names
-        info["tensor_types"] = list(layer_group.keys())
+        tensor_types = list(layer_group.keys())
+        
+        # CRITICAL FIX: Explicitly check for has_gradients attribute
+        if "has_gradients" in layer_group.attrs and layer_group.attrs["has_gradients"]:
+            if "gradients" not in tensor_types:
+                print(f"Layer {layer_name} has has_gradients=True but no gradients group found")
+                # Try to see if there's a hidden gradients group
+                try:
+                    if hasattr(layer_group, 'gradients') or (hasattr(layer_group, '__contains__') and 'gradients' in layer_group):
+                        print(f"Found hidden gradients group for layer {layer_name}")
+                        tensor_types.append("gradients")
+                except Exception as e:
+                    print(f"Error checking for hidden gradients group: {e}")
+        
+        info["tensor_types"] = tensor_types
         info["tensors"] = {}
         
-        for tensor_type in layer_group.keys():
-            tensor_group = layer_group[tensor_type]
-            info["tensors"][tensor_type] = list(tensor_group.keys())
+        for tensor_type in tensor_types:
+            try:
+                tensor_group = layer_group[tensor_type]
+                tensor_names = list(tensor_group.keys())
+                info["tensors"][tensor_type] = tensor_names
+                
+                # Print for debugging if this is a gradients group
+                if tensor_type == "gradients":
+                    print(f"Found gradient tensors for layer {layer_name}: {tensor_names}")
+            except Exception as e:
+                print(f"Error getting tensor names for {layer_name}/{tensor_type}: {e}")
+                info["tensors"][tensor_type] = []
         
         # Cache the result
         self._layer_info_cache[layer_name] = info
@@ -785,7 +808,9 @@ class IcechunkModelAnalyzer:
             layers = self.get_layer_names()
             
         stats = {}
+        total_layers = len(layers)
         total_layers_with_gradients = 0
+        total_gradient_tensors = 0
         
         # Analyze each layer
         for name in layers:
@@ -801,10 +826,24 @@ class IcechunkModelAnalyzer:
             # Get all gradient tensors for this layer
             tensors = layer_info.get("tensors", {}).get("gradients", [])
             
+            if not tensors:
+                print(f"Layer {name} has 'gradients' tensor type but no gradient tensors were found.")
+                continue
+            
+            layer_gradient_count = 0
+            
             for tensor_name in tensors:
                 try:
                     # Get gradient data
                     grad_data = self.get_tensor_data(name, "gradients", tensor_name)
+                    
+                    # Check if we actually got data
+                    if grad_data.size == 0:
+                        print(f"Warning: Empty gradient data for {name}/{tensor_name}")
+                        continue
+                    
+                    layer_gradient_count += 1
+                    total_gradient_tensors += 1
                     
                     # Calculate statistics
                     tensor_stats = {
@@ -828,17 +867,122 @@ class IcechunkModelAnalyzer:
                 except Exception as e:
                     print(f"Error analyzing gradients for {name}/{tensor_name}: {e}")
             
-            if layer_stats:
+            if layer_gradient_count > 0:
                 stats[name] = layer_stats
+                print(f"Found {layer_gradient_count} gradient tensors for layer {name}")
+            else:
+                print(f"No valid gradient tensors found for layer {name}")
         
         # Add summary information
         summary = {
-            "total_layers": len(layers),
+            "total_layers": total_layers,
             "layers_with_gradients": total_layers_with_gradients,
-            "gradient_coverage": total_layers_with_gradients / len(layers) if layers else 0
+            "total_gradient_tensors": total_gradient_tensors,
+            "gradient_coverage": total_layers_with_gradients / total_layers if total_layers else 0
         }
+        
+        if total_gradient_tensors == 0:
+            print("WARNING: No gradient tensors were found in the dataset!")
+        else:
+            print(f"Found a total of {total_gradient_tensors} gradient tensors across {total_layers_with_gradients} layers")
         
         return {
             "summary": summary,
             "layer_stats": stats
-        } 
+        }
+
+    def get_optimizer_state(self, step: int) -> List[np.ndarray]:
+        """
+        Get the optimizer state for a specific step from the IceChunk store.
+
+        Args:
+            step: The training step (epoch) for which to retrieve the optimizer state.
+
+        Returns:
+            List of NumPy arrays representing the optimizer's state.
+            Returns an empty list if the state is not found for the given step.
+        """
+        optimizer_states_group_name = "optimizer_states"
+        if optimizer_states_group_name not in self.root_group: # self.root_group for IceChunk
+            print(f"Optimizer states not found in snapshot {self.snapshot_id}.")
+            return []
+
+        optimizer_states_group = self.root_group[optimizer_states_group_name]
+        step_group_name = f"step_{step}"
+
+        if step_group_name not in optimizer_states_group:
+            print(f"Optimizer state for step {step} not found in snapshot {self.snapshot_id}.")
+            return []
+
+        step_group = optimizer_states_group[step_group_name]
+        optimizer_weights = []
+        idx = 0
+        while True:
+            weight_array_name = f"weight_{idx}"
+            if weight_array_name in step_group:
+                # Safely get array data regardless of shape
+                weight_array = step_group[weight_array_name]
+                try:
+                    # For arrays with dimensions
+                    if weight_array.shape:
+                        optimizer_weights.append(weight_array[:])
+                    else:
+                        # For scalar arrays
+                        optimizer_weights.append(np.array(weight_array[()]))
+                except Exception as e:
+                    print(f"Error reading optimizer weight {weight_array_name} from snapshot {self.snapshot_id}: {e}")
+                    # Fallback: try getting as scalar
+                    try:
+                        optimizer_weights.append(np.array(weight_array.astype(float)))
+                    except:
+                        print(f"Could not read optimizer weight {weight_array_name} at step {step} from snapshot {self.snapshot_id}")
+                idx += 1
+            else:
+                break
+        
+        return optimizer_weights
+
+    def get_optimizer_config(self, optimizer_name: str = "optimizer") -> Dict[str, Any]:
+        """
+        Get the optimizer's configuration from the IceChunk store.
+
+        Args:
+            optimizer_name: The name of the optimizer config to retrieve (defaults to "optimizer").
+
+        Returns:
+            Dictionary containing the optimizer configuration.
+            Returns an empty dict if not found.
+        """
+        optimizer_info_group_name = "optimizer_info"
+        if optimizer_info_group_name not in self.root_group:
+            print(f"Optimizer info (configurations) not found in snapshot {self.snapshot_id}.")
+            return {}
+
+        optimizer_info_group = self.root_group[optimizer_info_group_name]
+
+        if optimizer_name not in optimizer_info_group:
+            print(f"Configuration for optimizer '{optimizer_name}' not found in snapshot {self.snapshot_id}.")
+            # Check if default 'optimizer' exists if a specific one was requested and not found
+            if optimizer_name != "optimizer" and "optimizer" in optimizer_info_group:
+                print(f"Returning config for default 'optimizer' instead.")
+                optimizer_name = "optimizer"
+            else:
+                return {}
+            
+        opt_config_group = optimizer_info_group[optimizer_name]
+        config = {}
+        # In IceChunk/Zarr, attributes are directly accessible and should be of correct type or JSON string
+        for key, value in opt_config_group.attrs.items():
+            if isinstance(value, str):
+                try:
+                    # Attempt to parse if it looks like a JSON string
+                    # (e.g., complex objects might be stored as JSON strings in attributes)
+                    parsed_value = json.loads(value)
+                    config[key] = parsed_value
+                except (json.JSONDecodeError, TypeError):
+                    # If not a valid JSON string, use the string value as is
+                    config[key] = value
+            else:
+                # If not a string, assume it's already the correct type
+                config[key] = value
+        return config 

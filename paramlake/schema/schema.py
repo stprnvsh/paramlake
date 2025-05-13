@@ -196,6 +196,36 @@ ZARR_SCHEMA = {
                         },
                     },
                 },
+                "optimizer_states": {
+                    "description": "Group containing optimizer states at different steps",
+                    "structure": {
+                        "step_{step_number}": {
+                            "description": "Optimizer state at a specific step. Contains multiple arrays, one for each optimizer weight/variable.",
+                            "arrays": {
+                                "weight_{index}": {
+                                    "description": "An individual weight/state tensor from the optimizer.",
+                                    "shape": "(*tensor_shape)",
+                                    "attributes": {
+                                        "dtype": "Data type of the tensor"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "optimizer_info": {
+                    "description": "Group containing optimizer configuration(s). Typically one per run.",
+                    "structure": {
+                        "{optimizer_name}": {
+                            "description": "Configuration for a specific optimizer.",
+                            "attributes": {
+                                "name": "Name of the optimizer (e.g., Adam)",
+                                "learning_rate": "Learning rate",
+                                "hyperparameter_...": "Other optimizer-specific hyperparameters stored as attributes."
+                            }
+                        }
+                    }
+                }
             },
         },
     },

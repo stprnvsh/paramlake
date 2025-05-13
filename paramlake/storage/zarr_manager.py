@@ -9,6 +9,7 @@ import queue
 import time
 import psutil
 from typing import Any, Dict, List, Optional, Tuple, Union
+from datetime import datetime
 
 import numpy as np
 import zarr
@@ -54,6 +55,24 @@ class ZarrStorageManager(StorageInterface):
             self.metrics_group = self.run_group.create_group("metrics")
         else:
             self.metrics_group = self.run_group["metrics"]
+        
+        # Create optimizer_states group if it doesn't exist
+        if "optimizer_states" not in self.run_group:
+            self.optimizer_states_group = self.run_group.create_group("optimizer_states")
+        else:
+            self.optimizer_states_group = self.run_group["optimizer_states"]
+        
+        # Create optimizer_info group if it doesn't exist
+        if "optimizer_info" not in self.run_group:
+            self.optimizer_info_group = self.run_group.create_group("optimizer_info")
+        else:
+            self.optimizer_info_group = self.run_group["optimizer_info"]
+            
+        # Create checkpoints group if it doesn't exist
+        if "checkpoints" not in self.run_group:
+            self.checkpoints_group = self.run_group.create_group("checkpoints")
+        else:
+            self.checkpoints_group = self.run_group["checkpoints"]
         
         # Track the current step
         self.current_step = 0
@@ -353,6 +372,12 @@ class ZarrStorageManager(StorageInterface):
         # Use provided step or current step
         current_step = step if step is not None else self.current_step
         
+        # CRITICAL FIX: For gradients, make sure the layer has the gradients attribute set
+        if tensor_type == "gradients":
+            layer_group.attrs["has_gradients"] = True
+            # Print for debugging
+            print(f"Setting has_gradients=True for layer {layer_group.name}")
+        
         if self.async_enabled:
             # Make a copy of the data to prevent it from being modified before writing
             tensor_data_copy = tensor_data.copy()
@@ -389,14 +414,79 @@ class ZarrStorageManager(StorageInterface):
         """
         # Create a subgroup for the tensor type if it doesn't exist
         if tensor_type not in layer_group:
-            tensor_group = layer_group.create_group(tensor_type)
+            try:
+                tensor_group = layer_group.create_group(tensor_type)
+                # CRITICAL: For gradients, print debug information and set flag
+                if tensor_type == "gradients":
+                    print(f"Created new gradients group for {layer_group.name}")
+                    layer_group.attrs["has_gradients"] = True
+            except Exception as e:
+                print(f"Error creating tensor group for type {tensor_type}: {e}")
+                # Try again with a different approach - sometimes there are race conditions
+                if tensor_type in layer_group:
+                    tensor_group = layer_group[tensor_type]
+                else:
+                    raise
         else:
             tensor_group = layer_group[tensor_type]
         
+        # CRITICAL FIX: Handle shape conflicts by checking existing arrays
+        shape_conflict = False
+        create_new_array = True
+        
+        if tensor_name in tensor_group:
+            # Check if shapes are compatible
+            existing_array = tensor_group[tensor_name]
+            
+            # Check if shapes match (ignoring time dimension)
+            if len(existing_array.shape) > 1 and tensor_data.shape == existing_array.shape[1:]:
+                # Shapes match, just need to check if resizing is needed
+                if step >= existing_array.shape[0]:
+                    try:
+                        # Resize to accommodate current step
+                        new_shape = (step + 1,) + tensor_data.shape
+                        existing_array.resize(new_shape)
+                        create_new_array = False
+                    except Exception as e:
+                        print(f"Error resizing array {tensor_name}: {e}")
+                        # Try to use a new name
+                        shape_conflict = True
+                else:
+                    # No resize needed
+                    create_new_array = False
+            else:
+                # Shapes don't match, need to create a new array with a different name
+                print(f"Shape conflict for {tensor_name}: expected {existing_array.shape[1:]} but got {tensor_data.shape}")
+                shape_conflict = True
+        
+        # If we have a shape conflict, create a new array with a unique name
+        if shape_conflict:
+            # Create a unique tensor name based on shape
+            original_name = tensor_name
+            tensor_name = f"{original_name}_{tensor_data.shape}"
+            print(f"Using alternate name for {original_name}: {tensor_name}")
+            
+            # Check if this alternate name already exists
+            if tensor_name in tensor_group:
+                # If it exists, check if shapes match
+                alt_array = tensor_group[tensor_name]
+                if tensor_data.shape == alt_array.shape[1:]:
+                    # Shapes match, check if resize is needed
+                    if step >= alt_array.shape[0]:
+                        try:
+                            new_shape = (step + 1,) + tensor_data.shape
+                            alt_array.resize(new_shape)
+                        except Exception as e:
+                            print(f"Error resizing alternate array {tensor_name}: {e}")
+                            # We'll create a new array below
+                    else:
+                        create_new_array = False
+                        tensor_array = alt_array
+        
         # Create or get array for this tensor
-        if tensor_name not in tensor_group:
+        if create_new_array:
             # Initialize with time dimension
-            full_shape = (0,) + tensor_data.shape
+            full_shape = (max(step + 1, 1),) + tensor_data.shape
             chunks = self.determine_chunks(full_shape, tensor_type)
             
             # Create array with room for growth
@@ -416,16 +506,53 @@ class ZarrStorageManager(StorageInterface):
             if tensor_type == "gradients":
                 tensor_array.attrs["first_gradient_step"] = step
                 layer_group.attrs["has_gradients"] = True
+                print(f"Created new gradient array for {layer_group.name}/{tensor_name}")
         else:
             tensor_array = tensor_group[tensor_name]
         
-        # Resize array if needed to accommodate the current step
-        if step >= tensor_array.shape[0]:
-            new_shape = (step + 1,) + tensor_data.shape
-            tensor_array.resize(new_shape)
-        
         # Store the data at the current step
-        tensor_array[step] = tensor_data
+        try:
+            tensor_array[step] = tensor_data
+            
+            # Additional debugging for gradients
+            if tensor_type == "gradients":
+                print(f"Stored gradient data for {layer_group.name}/{tensor_name} at step {step} with shape {tensor_data.shape}")
+        except Exception as e:
+            print(f"Error storing data in array {tensor_name}: {e}")
+            # This could be a shape mismatch, try to handle it
+            try:
+                print(f"Attempting alternate storage with new array for {tensor_name}")
+                new_name = f"{tensor_name}_step{step}"
+                # Create a new dataset just for this step
+                new_array = tensor_group.create_dataset(
+                    new_name,
+                    shape=(1,) + tensor_data.shape,
+                    chunks=self.determine_chunks((1,) + tensor_data.shape, tensor_type),
+                    dtype=tensor_data.dtype,
+                    compressor=self.get_compressor(tensor_type),
+                )
+                new_array[0] = tensor_data
+                print(f"Successfully stored data using alternate array {new_name}")
+                
+                # Store metadata
+                new_array.attrs["shape"] = tensor_data.shape
+                new_array.attrs["dtype"] = str(tensor_data.dtype)
+                new_array.attrs["original_tensor"] = tensor_name
+                new_array.attrs["step"] = step
+                
+                if tensor_type == "gradients":
+                    print(f"Stored gradient with alternate method for {layer_group.name}/{new_name}")
+            except Exception as e2:
+                print(f"All attempts to store data failed: {e2}")
+        
+        # Ensure data is flushed to storage for gradients
+        if tensor_type == "gradients":
+            # Try to flush if the store supports it
+            try:
+                if hasattr(tensor_array.store, 'flush'):
+                    tensor_array.store.flush()
+            except Exception as e:
+                print(f"Warning: Could not flush gradient data: {e}")
         
         # Log storage of gradient data if it's the first time and verbose is enabled
         if tensor_type == "gradients" and self.config.get("verbose", False):
@@ -515,6 +642,86 @@ class ZarrStorageManager(StorageInterface):
         """Get list of tracked layers."""
         return list(self.tracked_layers)
     
+    def store_optimizer_state(
+        self,
+        optimizer_weights: List[np.ndarray],
+        step: Optional[int] = None,
+    ) -> None:
+        """
+        Store the optimizer's state (weights).
+
+        Args:
+            optimizer_weights: List of NumPy arrays representing optimizer state.
+            step: Current step.
+        """
+        current_step = step if step is not None else self.current_step
+        
+        # Create a group for the current step if it doesn't exist
+        step_group_name = f"step_{current_step}"
+        if step_group_name not in self.optimizer_states_group:
+            step_group = self.optimizer_states_group.create_group(step_group_name)
+        else:
+            step_group = self.optimizer_states_group[step_group_name]
+            
+        for idx, weight_data in enumerate(optimizer_weights):
+            weight_array_name = f"weight_{idx}"
+            
+            # Unlike other tensors, optimizer states are per step, not time-series within one array.
+            # So, we create/overwrite the dataset at each step for each weight.
+            if weight_array_name in step_group:
+                # If it exists, ensure it's compatible or decide on overwrite/error
+                # For simplicity, we'll overwrite. Zarr handles this if shape/dtype match.
+                # If not, it might be better to delete and recreate, but that adds complexity.
+                # Let's assume simple overwrite is fine. If not, `del step_group[weight_array_name]`
+                # could be added before create_dataset.
+                pass
+
+            # Optimizer weight arrays usually don't need complex chunking per step.
+            # Auto-chunking (chunks=True) or no chunking (chunks=None for contiguous) is fine.
+            # Using a generic compressor category or a new one like "optimizer_state".
+            weight_array = step_group.create_dataset(
+                weight_array_name,
+                data=weight_data, # Directly pass data for creation
+                chunks=True, # Let Zarr decide chunking for individual optimizer weights
+                dtype=weight_data.dtype,
+                compressor=self.get_compressor("optimizer_state"), # Specify a compressor category
+                overwrite=True # Ensure we can update if called multiple times for same step (though unlikely here)
+            )
+            weight_array.attrs["dtype"] = str(weight_data.dtype)
+    
+    def store_optimizer_config(
+        self,
+        optimizer_name: str,
+        optimizer_config: Dict[str, Any],
+        step: Optional[int] = None,
+    ) -> None:
+        """
+        Store the optimizer's configuration.
+        Since config is usually static, we store it once under optimizer_info.
+        If called multiple times, it will overwrite.
+        The step argument is ignored here as config is not stored per step.
+        """
+        # Store config as attributes of a group named after the optimizer
+        if optimizer_name not in self.optimizer_info_group:
+            opt_config_group = self.optimizer_info_group.create_group(optimizer_name)
+        else:
+            opt_config_group = self.optimizer_info_group[optimizer_name]
+        
+        # Clear existing attributes before writing new ones to ensure clean state
+        opt_config_group.attrs.clear()
+        
+        for key, value in optimizer_config.items():
+            try:
+                opt_config_group.attrs[key] = value
+            except TypeError:
+                # If direct assignment fails (e.g., complex objects not natively supported by Zarr attrs),
+                # try storing as a JSON string.
+                try:
+                    opt_config_group.attrs[key] = json.dumps(value)
+                except Exception as e_json:
+                    print(f"Warning: Could not store optimizer config key '{key}' for optimizer '{optimizer_name}'. Value: {value}. Error: {e_json}")
+                    opt_config_group.attrs[key] = str(value) # Fallback to string representation
+    
     def close(self) -> None:
         """Close the storage manager and finalize the dataset."""
         # If async enabled, wait for all tasks to complete
@@ -536,3 +743,291 @@ class ZarrStorageManager(StorageInterface):
                 
         # Store final step
         self.run_group.attrs["final_step"] = self.current_step 
+
+    def save_checkpoint(
+        self,
+        weights_data: List[np.ndarray],
+        weights_names: List[str],
+        weights_shapes: List[Tuple[int, ...]],
+        optimizer_data: List[np.ndarray],
+        optimizer_config: Optional[Dict[str, Any]],
+        compile_config: Optional[Dict[str, Any]],
+        metadata: Dict[str, Any],
+        step: Optional[int] = None,
+    ) -> str:
+        """
+        Save a model checkpoint.
+        
+        Args:
+            weights_data: List of weight arrays
+            weights_names: List of weight names
+            weights_shapes: List of weight shapes
+            optimizer_data: List of optimizer state arrays
+            optimizer_config: Optimizer configuration
+            compile_config: Model compilation configuration
+            metadata: Checkpoint metadata
+            step: Current step (if None, uses internal counter)
+            
+        Returns:
+            Checkpoint ID
+        """
+        # Use provided step or current step
+        current_step = step if step is not None else self.current_step
+        
+        # Generate a unique checkpoint ID
+        checkpoint_id = f"checkpoint_{current_step}_{int(time.time())}"
+        
+        # Add timestamp to metadata
+        metadata["timestamp"] = datetime.now().isoformat()
+        metadata["step"] = current_step
+        
+        # Create a new checkpoint group
+        checkpoint_group = self.checkpoints_group.create_group(checkpoint_id)
+        
+        # Store metadata
+        for key, value in metadata.items():
+            checkpoint_group.attrs[key] = value
+        
+        # Store weights
+        weights_group = checkpoint_group.create_group("weights")
+        
+        # Store weight arrays
+        for i, (weight_data, weight_name, weight_shape) in enumerate(zip(weights_data, weights_names, weights_shapes)):
+            # Store weight data
+            weight_array = weights_group.create_dataset(
+                f"weight_{i}",
+                data=weight_data,
+                chunks=True,
+                compressor=self.get_compressor()
+            )
+            
+            # Store metadata
+            weight_array.attrs["name"] = weight_name
+            # Convert TensorShape to tuple to make it JSON serializable
+            if hasattr(weight_shape, "__iter__"):
+                weight_array.attrs["shape"] = tuple(weight_shape)
+            else:
+                weight_array.attrs["shape"] = str(weight_shape)  # Convert to string if not iterable
+        
+        # Store optimizer data if available
+        if optimizer_data and len(optimizer_data) > 0:
+            optimizer_group = checkpoint_group.create_group("optimizer")
+            
+            # Store optimizer config
+            if optimizer_config:
+                try:
+                    optimizer_group.attrs["config"] = json.dumps(optimizer_config)
+                except TypeError:
+                    # If there are unserializable objects, store them as strings
+                    optimizer_config_serializable = {}
+                    for k, v in optimizer_config.items():
+                        try:
+                            json.dumps({k: v})  # Test if serializable
+                            optimizer_config_serializable[k] = v
+                        except TypeError:
+                            optimizer_config_serializable[k] = str(v)
+                    optimizer_group.attrs["config"] = json.dumps(optimizer_config_serializable)
+            
+            # Store optimizer weights
+            for i, opt_weight in enumerate(optimizer_data):
+                optimizer_group.create_dataset(
+                    f"weight_{i}",
+                    data=opt_weight,
+                    chunks=True,
+                    compressor=self.get_compressor()
+                )
+        
+        # Store compile config if available
+        if compile_config:
+            try:
+                checkpoint_group.attrs["compile_config"] = json.dumps(compile_config)
+            except TypeError:
+                # If there are unserializable objects, store them as strings
+                compile_config_serializable = {}
+                for k, v in compile_config.items():
+                    try:
+                        json.dumps({k: v})  # Test if serializable
+                        compile_config_serializable[k] = v
+                    except TypeError:
+                        compile_config_serializable[k] = str(v)
+                checkpoint_group.attrs["compile_config"] = json.dumps(compile_config_serializable)
+        
+        return checkpoint_id
+    
+    def load_checkpoint(self, checkpoint_id: str) -> Dict[str, Any]:
+        """
+        Load a checkpoint by ID.
+        
+        Args:
+            checkpoint_id: ID of the checkpoint
+            
+        Returns:
+            Dictionary with checkpoint data
+        """
+        if checkpoint_id not in self.checkpoints_group:
+            raise ValueError(f"Checkpoint {checkpoint_id} not found")
+            
+        checkpoint_group = self.checkpoints_group[checkpoint_id]
+        
+        # Load metadata
+        metadata = dict(checkpoint_group.attrs)
+        
+        # Load weights
+        weights_data = []
+        weights_names = []
+        weights_shapes = []
+        
+        if "weights" in checkpoint_group:
+            weights_group = checkpoint_group["weights"]
+            
+            # Sort weight keys to ensure correct order
+            weight_keys = sorted(
+                weights_group.keys(),
+                key=lambda k: int(k.split("_")[1]) if "_" in k else 0
+            )
+            
+            for key in weight_keys:
+                weight = weights_group[key]
+                weights_data.append(weight[:])
+                weights_names.append(weight.attrs.get("name", key))
+                weights_shapes.append(weight.attrs.get("shape", weight.shape))
+        
+        # Load optimizer data if available
+        optimizer_data = []
+        optimizer_config = None
+        
+        if "optimizer" in checkpoint_group:
+            optimizer_group = checkpoint_group["optimizer"]
+            
+            # Load optimizer config
+            if "config" in optimizer_group.attrs:
+                try:
+                    optimizer_config = json.loads(optimizer_group.attrs["config"])
+                except json.JSONDecodeError:
+                    optimizer_config = optimizer_group.attrs["config"]
+            
+            # Load optimizer weights
+            opt_keys = sorted(
+                [k for k in optimizer_group.keys() if k.startswith("weight_")],
+                key=lambda k: int(k.split("_")[1])
+            )
+            
+            for key in opt_keys:
+                optimizer_data.append(optimizer_group[key][:])
+        
+        # Load compile config if available
+        compile_config = None
+        if "compile_config" in checkpoint_group.attrs:
+            try:
+                compile_config = json.loads(checkpoint_group.attrs["compile_config"])
+            except json.JSONDecodeError:
+                compile_config = checkpoint_group.attrs["compile_config"]
+        
+        return {
+            "weights_data": weights_data,
+            "weights_names": weights_names,
+            "weights_shapes": weights_shapes,
+            "optimizer_data": optimizer_data,
+            "optimizer_config": optimizer_config,
+            "compile_config": compile_config,
+            "metadata": metadata
+        }
+    
+    def load_checkpoint_by_step(self, step: int) -> Dict[str, Any]:
+        """
+        Load a checkpoint by step number.
+        
+        Args:
+            step: Step number
+            
+        Returns:
+            Dictionary with checkpoint data
+        """
+        # Find checkpoints for this step
+        matching_checkpoints = []
+        
+        for checkpoint_id in self.checkpoints_group.keys():
+            checkpoint_group = self.checkpoints_group[checkpoint_id]
+            if checkpoint_group.attrs.get("step") == step:
+                matching_checkpoints.append(checkpoint_id)
+        
+        if not matching_checkpoints:
+            raise ValueError(f"No checkpoint found for step {step}")
+        
+        # If multiple checkpoints for this step, use the latest one
+        if len(matching_checkpoints) > 1:
+            # Sort by timestamp if available, otherwise by ID
+            latest_checkpoint = max(
+                matching_checkpoints,
+                key=lambda cid: self.checkpoints_group[cid].attrs.get("timestamp", cid)
+            )
+        else:
+            latest_checkpoint = matching_checkpoints[0]
+        
+        return self.load_checkpoint(latest_checkpoint)
+    
+    def load_latest_checkpoint(self) -> Dict[str, Any]:
+        """
+        Load the latest checkpoint.
+        
+        Returns:
+            Dictionary with checkpoint data
+        """
+        if not self.checkpoints_group.keys():
+            raise ValueError("No checkpoints found")
+        
+        # Find the latest checkpoint by timestamp or step
+        latest_checkpoint = None
+        latest_timestamp = None
+        latest_step = -1
+        
+        for checkpoint_id in self.checkpoints_group.keys():
+            checkpoint_group = self.checkpoints_group[checkpoint_id]
+            
+            # First try to use timestamp
+            if "timestamp" in checkpoint_group.attrs:
+                timestamp = checkpoint_group.attrs["timestamp"]
+                if latest_timestamp is None or timestamp > latest_timestamp:
+                    latest_timestamp = timestamp
+                    latest_checkpoint = checkpoint_id
+            # Fallback to using step
+            elif "step" in checkpoint_group.attrs:
+                step = checkpoint_group.attrs["step"]
+                if step > latest_step:
+                    latest_step = step
+                    latest_checkpoint = checkpoint_id
+        
+        # If no timestamps or steps found, use the last checkpoint
+        if latest_checkpoint is None:
+            latest_checkpoint = list(self.checkpoints_group.keys())[-1]
+        
+        return self.load_checkpoint(latest_checkpoint)
+    
+    def list_checkpoints(self) -> List[Dict[str, Any]]:
+        """
+        List all available checkpoints.
+        
+        Returns:
+            List of dictionaries with checkpoint metadata
+        """
+        checkpoints = []
+        
+        for checkpoint_id in self.checkpoints_group.keys():
+            checkpoint_group = self.checkpoints_group[checkpoint_id]
+            metadata = dict(checkpoint_group.attrs)
+            metadata["id"] = checkpoint_id
+            
+            # Add weight count for informational purposes
+            if "weights" in checkpoint_group:
+                metadata["weight_count"] = len(checkpoint_group["weights"].keys())
+            
+            # Add optimizer info
+            metadata["has_optimizer"] = "optimizer" in checkpoint_group
+            
+            checkpoints.append(metadata)
+        
+        # Sort by step, then timestamp
+        return sorted(
+            checkpoints,
+            key=lambda c: (c.get("step", 0), c.get("timestamp", ""))
+        ) 

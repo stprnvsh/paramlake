@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+from datetime import datetime
 
 import numpy as np
 import zarr
@@ -159,6 +160,15 @@ class IcechunkStorageManager(StorageInterface):
         # Tracked layers for debugging
         self.tracked_layers = set()
 
+        # Create checkpoints group if it doesn't exist
+        if "checkpoints" not in self.root_group:
+            self.checkpoints_group = self.root_group.create_group("checkpoints")
+        else:
+            self.checkpoints_group = self.root_group["checkpoints"]
+
+        # Track checkpoint snapshots
+        self.checkpoint_snapshots = {}
+
     def _initialize_zarr_groups(self):
         """Initialize the basic zarr group structure needed for ParamLake."""
         # Root group is already created by icechunk
@@ -176,6 +186,18 @@ class IcechunkStorageManager(StorageInterface):
         else:
             self.metrics_group = self.root_group["metrics"]
             
+        # Create optimizer_states group if it doesn't exist
+        if "optimizer_states" not in self.root_group:
+            self.optimizer_states_group = self.root_group.create_group("optimizer_states")
+        else:
+            self.optimizer_states_group = self.root_group["optimizer_states"]
+            
+        # Create optimizer_info group if it doesn't exist
+        if "optimizer_info" not in self.root_group:
+            self.optimizer_info_group = self.root_group.create_group("optimizer_info")
+        else:
+            self.optimizer_info_group = self.root_group["optimizer_info"]
+        
         # Initialize run metadata if this is a new run
         self._initialize_run_metadata()
         
@@ -300,6 +322,7 @@ class IcechunkStorageManager(StorageInterface):
                     if tensor_type == "gradients":
                         array.attrs["first_gradient_step"] = step
                         layer_group.attrs["has_gradients"] = True
+                        print(f"Created new gradient array for {layer_group.name}/{tensor_name} with shape {array.shape}")
                 except Exception as e:
                     # If we can't create the array either, we're likely after a commit
                     # and need to re-initialize the session
@@ -327,6 +350,7 @@ class IcechunkStorageManager(StorageInterface):
                         if tensor_type == "gradients":
                             array.attrs["first_gradient_step"] = step
                             layer_group.attrs["has_gradients"] = True
+                            print(f"Created new gradient array after session refresh for {layer_group.name}/{tensor_name}")
                     except Exception as e2:
                         print(f"Failed to create array even after session refresh: {e2}")
                         return
@@ -336,6 +360,18 @@ class IcechunkStorageManager(StorageInterface):
                 try:
                     # Store tensor data at the appropriate step
                     array[current_step] = tensor_data
+                    
+                    # For gradients, verify the write was successful
+                    if tensor_type == "gradients":
+                        # Try to verify the data was written by reading it back
+                        try:
+                            verification_data = array[current_step]
+                            # Check if shapes match
+                            if verification_data.shape != tensor_data.shape:
+                                print(f"Warning: Gradient shape mismatch after write for {layer_group.name}/{tensor_name}")
+                            # Additional verification could be added here
+                        except Exception as e_verify:
+                            print(f"Warning: Could not verify gradient write for {layer_group.name}/{tensor_name}: {e_verify}")
                     
                     # Log storage of gradient data if it's the first time and verbose is enabled
                     if tensor_type == "gradients" and self.config.get("verbose", False):
@@ -354,6 +390,15 @@ class IcechunkStorageManager(StorageInterface):
                                     print(f"Warning: Very large gradient magnitude ({abs_mean:.2e}) for {layer_group.name}/{tensor_name}")
                             except:
                                 pass
+                    
+                    # For gradients, consider forcing a commit more frequently
+                    if tensor_type == "gradients" and current_step > 0 and current_step % 5 == 0:
+                        # Attempt to flush the store if supported
+                        if hasattr(self.store, 'flush'):
+                            try:
+                                self.store.flush()
+                            except Exception as e_flush:
+                                print(f"Warning: Could not flush store after gradient write: {e_flush}")
                 except Exception as e:
                     print(f"Error writing data to array {tensor_name}: {e}")
             
@@ -728,4 +773,634 @@ class IcechunkStorageManager(StorageInterface):
             
     def get_tracked_layers(self) -> List[str]:
         """Get list of tracked layers."""
-        return list(self.tracked_layers) 
+        return list(self.tracked_layers)
+
+    def store_optimizer_state(
+        self,
+        optimizer_weights: List[np.ndarray],
+        step: Optional[int] = None,
+    ) -> None:
+        """
+        Store the optimizer's state (weights).
+
+        Args:
+            optimizer_weights: List of NumPy arrays representing optimizer state.
+            step: Current step.
+        """
+        try:
+            current_step = step if step is not None else self.current_step
+            
+            step_group_name = f"step_{current_step}"
+            # For IceChunk, we need to handle potential read-only state after commit.
+            # We ensure the group exists or create it. If creation fails, refresh session.
+            try:
+                if step_group_name not in self.optimizer_states_group:
+                    step_group = self.optimizer_states_group.create_group(step_group_name)
+                else:
+                    step_group = self.optimizer_states_group[step_group_name]
+            except Exception as e_group_create:
+                print(f"Error creating/accessing step group {step_group_name} for optimizer state: {e_group_create}. Refreshing session.")
+                self._refresh_session_after_commit()
+                # After refresh, self.optimizer_states_group will be updated.
+                if step_group_name not in self.optimizer_states_group:
+                    step_group = self.optimizer_states_group.create_group(step_group_name)
+                else:
+                    step_group = self.optimizer_states_group[step_group_name]
+
+            for idx, weight_data in enumerate(optimizer_weights):
+                weight_array_name = f"weight_{idx}"
+                try:
+                    # Optimizer states are discrete per step, so create_dataset with overwrite is appropriate.
+                    # IceChunk handles the backend Zarr array creation.
+                    # The compressor is None for IceChunk as it manages its own compression.
+                    step_group.create_dataset(
+                        weight_array_name,
+                        data=weight_data,
+                        chunks=True,  # Let Zarr (via IceChunk) decide chunking for these individual arrays
+                        dtype=weight_data.dtype,
+                        overwrite=True,
+                        # compressor=self.get_compressor("optimizer_state") # IceChunk handles compression
+                    )
+                    # step_group[weight_array_name].attrs["dtype"] = str(weight_data.dtype) # Not strictly needed if dtype is in array
+                except Exception as e_array_create:
+                    print(f"Error storing optimizer weight {weight_array_name} for step {current_step}: {e_array_create}. Attempting session refresh.")
+                    self._refresh_session_after_commit()
+                    # Retry after refresh for this specific weight
+                    if step_group_name not in self.optimizer_states_group: # Re-check step_group after refresh
+                        step_group = self.optimizer_states_group.create_group(step_group_name)
+                    else:
+                        step_group = self.optimizer_states_group[step_group_name]
+                    
+                    step_group.create_dataset(
+                        weight_array_name,
+                        data=weight_data,
+                        chunks=True,
+                        dtype=weight_data.dtype,
+                        overwrite=True,
+                    )
+
+        except Exception as e:
+            import traceback
+            print(f"Error storing optimizer state at step {step}:")
+            traceback.print_exc()
+
+    def store_optimizer_config(
+        self,
+        optimizer_name: str,
+        optimizer_config: Dict[str, Any],
+        step: Optional[int] = None,
+    ) -> None:
+        """
+        Store the optimizer's configuration in IceChunk.
+        The config is stored once per run, identified by optimizer_name.
+        The step argument is ignored.
+        """
+        try:
+            # Ensure the optimizer_info group exists, refreshing session if necessary
+            try:
+                if "optimizer_info" not in self.root_group:
+                    self.optimizer_info_group = self.root_group.create_group("optimizer_info")
+                else:
+                    self.optimizer_info_group = self.root_group["optimizer_info"]
+            except Exception as e_info_create:
+                print(f"Error accessing/creating optimizer_info group: {e_info_create}. Refreshing session.")
+                self._refresh_session_after_commit() # This re-initializes self.root_group and sub-groups
+                # self.optimizer_info_group should now be valid or recreated by _initialize_zarr_groups
+                if "optimizer_info" not in self.root_group: # Re-check after refresh
+                     self.optimizer_info_group = self.root_group.create_group("optimizer_info")
+                else:
+                    self.optimizer_info_group = self.root_group["optimizer_info"]
+
+
+            # Store config as attributes of a group named after the optimizer
+            # Need to handle potential read-only state after commit for this group too.
+            opt_config_group_name = optimizer_name
+            try:
+                if opt_config_group_name not in self.optimizer_info_group:
+                    opt_config_group = self.optimizer_info_group.create_group(opt_config_group_name)
+                else:
+                    opt_config_group = self.optimizer_info_group[opt_config_group_name]
+            except Exception as e_group_create:
+                print(f"Error accessing/creating optimizer config group '{opt_config_group_name}': {e_group_create}. Refreshing session.")
+                self._refresh_session_after_commit()
+                if opt_config_group_name not in self.optimizer_info_group: # Re-check after refresh
+                    opt_config_group = self.optimizer_info_group.create_group(opt_config_group_name)
+                else:
+                    opt_config_group = self.optimizer_info_group[opt_config_group_name]
+
+            # Clear existing attributes before writing new ones
+            opt_config_group.attrs.clear()
+            
+            for key, value in optimizer_config.items():
+                try:
+                    opt_config_group.attrs[key] = value
+                except TypeError:
+                    try:
+                        opt_config_group.attrs[key] = json.dumps(value)
+                    except Exception as e_json:
+                        print(f"Warning: Could not store optimizer config key '{key}' for '{optimizer_name}'. Value: {value}. Error: {e_json}")
+                        opt_config_group.attrs[key] = str(value) # Fallback to string
+            
+            # IceChunk requires a commit to persist attribute changes if they are part of a new snapshot.
+            # However, this method might be called frequently. 
+            # Committing here could be too frequent. The main commit_changes() method handles periodic commits.
+            # If this config is meant to be set once, the next natural commit will save it.
+            # If it can change and needs immediate persistence, a targeted commit would be needed.
+            # For now, relying on the periodic commit_changes.
+
+        except Exception as e:
+            import traceback
+            print(f"Error storing optimizer configuration for {optimizer_name}:")
+            traceback.print_exc()
+
+    def save_checkpoint(
+        self,
+        weights_data: List[np.ndarray],
+        weights_names: List[str],
+        weights_shapes: List[Tuple[int, ...]],
+        optimizer_data: List[np.ndarray],
+        optimizer_config: Optional[Dict[str, Any]],
+        compile_config: Optional[Dict[str, Any]],
+        metadata: Dict[str, Any],
+        step: Optional[int] = None,
+    ) -> str:
+        """
+        Save a model checkpoint using IceChunk's native snapshot capabilities.
+        
+        Args:
+            weights_data: List of weight arrays
+            weights_names: List of weight names
+            weights_shapes: List of weight shapes
+            optimizer_data: List of optimizer state arrays
+            optimizer_config: Optimizer configuration
+            compile_config: Model compilation configuration
+            metadata: Checkpoint metadata
+            step: Current step (if None, uses internal counter)
+            
+        Returns:
+            Checkpoint ID/snapshot ID
+        """
+        # Use provided step or current step
+        current_step = step if step is not None else self.current_step
+        
+        # Generate checkpoint name
+        checkpoint_name = metadata.get('name', None)
+        if checkpoint_name is None:
+            checkpoint_name = f"checkpoint_{current_step}"
+        
+        # Add timestamp and step to metadata
+        metadata["timestamp"] = datetime.now().isoformat()
+        metadata["step"] = current_step
+        
+        # Create a new checkpoint entry in the checkpoint index
+        checkpoint_index = self.checkpoints_group.create_group(checkpoint_name)
+        
+        # Store metadata in the checkpoint index
+        for key, value in metadata.items():
+            try:
+                checkpoint_index.attrs[key] = value
+            except Exception as e:
+                print(f"Error storing checkpoint metadata key {key}: {e}")
+                # Store as string if needed
+                checkpoint_index.attrs[key] = str(value)
+        
+        # Store the weights in a temporary group that will be captured in the snapshot
+        weights_group = self.root_group.create_group(f"temp_checkpoint_{int(time.time())}")
+        
+        # Store weights temporarily
+        for i, (weight_data, weight_name, weight_shape) in enumerate(zip(weights_data, weights_names, weights_shapes)):
+            try:
+                # Store weight data
+                weight_array = weights_group.create_dataset(
+                    f"weight_{i}",
+                    data=weight_data,
+                    chunks=True
+                )
+                
+                # Store metadata
+                weight_array.attrs["name"] = weight_name
+                weight_array.attrs["shape"] = str(weight_shape)  # Convert tuple to string
+            except Exception as e:
+                print(f"Error storing weight {i}: {e}")
+        
+        # Store optimizer data if available
+        if optimizer_data and len(optimizer_data) > 0:
+            try:
+                optimizer_group = weights_group.create_group("optimizer")
+                
+                # Store optimizer config
+                if optimizer_config:
+                    try:
+                        # Try to serialize the optimizer config
+                        optimizer_group.attrs["config"] = json.dumps(optimizer_config)
+                    except (TypeError, ValueError):
+                        # If serialization fails, store config entries as strings
+                        for key, value in optimizer_config.items():
+                            optimizer_group.attrs[f"config_{key}"] = str(value)
+                
+                # Store optimizer weights
+                for i, opt_weight in enumerate(optimizer_data):
+                    optimizer_group.create_dataset(
+                        f"weight_{i}",
+                        data=opt_weight,
+                        chunks=True
+                    )
+            except Exception as e:
+                print(f"Error storing optimizer data: {e}")
+        
+        # Store compile config if available
+        if compile_config:
+            try:
+                for key, value in compile_config.items():
+                    try:
+                        # Try to serialize complex values
+                        if isinstance(value, dict):
+                            checkpoint_index.attrs[f"compile_{key}"] = json.dumps(value)
+                        else:
+                            checkpoint_index.attrs[f"compile_{key}"] = str(value)
+                    except Exception as e:
+                        print(f"Error storing compile config key {key}: {e}")
+                        checkpoint_index.attrs[f"compile_{key}"] = str(value)
+            except Exception as e:
+                print(f"Error storing compile config: {e}")
+        
+        # Make sure everything is flushed
+        if hasattr(self.store, 'flush'):
+            self.store.flush()
+        
+        # Commit to create a snapshot
+        try:
+            description = metadata.get('description', f"Checkpoint at step {current_step}")
+            snapshot_id = self.session.commit(f"Checkpoint: {description}")
+            
+            # Store the snapshot ID in the checkpoint index
+            checkpoint_index.attrs["snapshot_id"] = snapshot_id
+            
+            # Create a tag for this checkpoint if configured
+            tag_name = f"checkpoint_{current_step}"
+            try:
+                # Only create the tag if it doesn't exist
+                if not self._tag_exists(tag_name):
+                    self.repo.create_tag(tag_name, snapshot_id=snapshot_id)
+                    self.created_tags.add(tag_name)
+            except Exception as e:
+                print(f"Warning: Could not create tag for checkpoint: {e}")
+            
+            # Track the checkpoint
+            self.checkpoint_snapshots[checkpoint_name] = snapshot_id
+            
+            # Clean up temporary group in a new session
+            self._refresh_session_after_commit()
+            
+            # Remove temporary group using the new session
+            try:
+                if f"temp_checkpoint_{int(time.time())}" in self.root_group:
+                    del self.root_group[f"temp_checkpoint_{int(time.time())}"]
+            except Exception as e:
+                print(f"Warning: Could not clean up temporary checkpoint group: {e}")
+            
+            return snapshot_id
+        except Exception as e:
+            print(f"Error committing checkpoint: {e}")
+            # Clean up the temporary checkpoint group
+            try:
+                if f"temp_checkpoint_{int(time.time())}" in self.root_group:
+                    del self.root_group[f"temp_checkpoint_{int(time.time())}"]
+            except:
+                pass
+            return None
+    
+    def load_checkpoint(self, checkpoint_id: str) -> Dict[str, Any]:
+        """
+        Load a checkpoint by ID.
+        
+        Args:
+            checkpoint_id: ID of the checkpoint or snapshot
+            
+        Returns:
+            Dictionary with checkpoint data
+        """
+        # First, check if the ID is a snapshot ID
+        snapshot_id = checkpoint_id
+        
+        # Check if checkpoint_id is a checkpoint name rather than a snapshot ID
+        if checkpoint_id in self.checkpoints_group:
+            checkpoint_group = self.checkpoints_group[checkpoint_id]
+            if "snapshot_id" in checkpoint_group.attrs:
+                snapshot_id = checkpoint_group.attrs["snapshot_id"]
+        
+        try:
+            # Create a readonly session with this snapshot
+            checkpoint_session = self.repo.readonly_session(snapshot_id=snapshot_id)
+            checkpoint_store = checkpoint_session.store
+            checkpoint_root = zarr.open_group(checkpoint_store, mode="r")
+            
+            # Look for checkpoint data in the snapshot
+            # First try to find the temporary checkpoint group
+            temp_groups = [k for k in checkpoint_root.keys() if k.startswith("temp_checkpoint_")]
+            
+            if temp_groups:
+                # Use the first temp group found
+                checkpoint_group = checkpoint_root[temp_groups[0]]
+            else:
+                # Fallback to looking for data in the main groups
+                checkpoint_group = checkpoint_root
+            
+            # Load weights
+            weights_data = []
+            weights_names = []
+            weights_shapes = []
+            
+            # Find all weight arrays in the checkpoint
+            weight_keys = sorted(
+                [k for k in checkpoint_group.keys() if k.startswith("weight_")],
+                key=lambda k: int(k.split("_")[1]) if "_" in k else 0
+            )
+            
+            for key in weight_keys:
+                try:
+                    weight = checkpoint_group[key]
+                    # Load weight data
+                    weights_data.append(weight[:])
+                    # Load weight name
+                    if "name" in weight.attrs:
+                        weights_names.append(weight.attrs["name"])
+                    else:
+                        weights_names.append(key)
+                    # Load weight shape
+                    if "shape" in weight.attrs:
+                        shape_str = weight.attrs["shape"]
+                        # Try to parse shape string if it was stored as a string
+                        if isinstance(shape_str, str):
+                            try:
+                                import ast
+                                shape = ast.literal_eval(shape_str)
+                                weights_shapes.append(shape)
+                            except:
+                                weights_shapes.append(weight.shape)
+                        else:
+                            weights_shapes.append(shape_str)
+                    else:
+                        weights_shapes.append(weight.shape)
+                except Exception as e:
+                    print(f"Error loading weight {key}: {e}")
+            
+            # Load optimizer data if available
+            optimizer_data = []
+            optimizer_config = None
+            
+            if "optimizer" in checkpoint_group:
+                optimizer_group = checkpoint_group["optimizer"]
+                
+                # Load optimizer config
+                if "config" in optimizer_group.attrs:
+                    try:
+                        optimizer_config = json.loads(optimizer_group.attrs["config"])
+                    except (json.JSONDecodeError, TypeError):
+                        # Try to build optimizer config from individual attributes
+                        optimizer_config = {}
+                        for key in optimizer_group.attrs:
+                            if key.startswith("config_"):
+                                config_key = key[7:]  # Remove "config_" prefix
+                                optimizer_config[config_key] = optimizer_group.attrs[key]
+                
+                # Load optimizer weights
+                opt_keys = sorted(
+                    [k for k in optimizer_group.keys() if k.startswith("weight_")],
+                    key=lambda k: int(k.split("_")[1]) if "_" in k else 0
+                )
+                
+                for key in opt_keys:
+                    try:
+                        optimizer_data.append(optimizer_group[key][:])
+                    except Exception as e:
+                        print(f"Error loading optimizer weight {key}: {e}")
+            
+            # Look for compile config
+            compile_config = {}
+            
+            # Check checkpoint index for compile config
+            if checkpoint_id in self.checkpoints_group:
+                index_group = self.checkpoints_group[checkpoint_id]
+                for key in index_group.attrs:
+                    if key.startswith("compile_"):
+                        config_key = key[8:]  # Remove "compile_" prefix
+                        try:
+                            if index_group.attrs[key].startswith('{'):
+                                compile_config[config_key] = json.loads(index_group.attrs[key])
+                            else:
+                                compile_config[config_key] = index_group.attrs[key]
+                        except:
+                            compile_config[config_key] = index_group.attrs[key]
+            
+            # Get metadata from checkpoint index
+            metadata = {}
+            if checkpoint_id in self.checkpoints_group:
+                index_group = self.checkpoints_group[checkpoint_id]
+                for key in index_group.attrs:
+                    if not key.startswith("compile_"):
+                        metadata[key] = index_group.attrs[key]
+            
+            return {
+                "weights_data": weights_data,
+                "weights_names": weights_names,
+                "weights_shapes": weights_shapes,
+                "optimizer_data": optimizer_data,
+                "optimizer_config": optimizer_config,
+                "compile_config": compile_config if compile_config else None,
+                "metadata": metadata
+            }
+            
+        except Exception as e:
+            print(f"Error loading checkpoint from snapshot {snapshot_id}: {e}")
+            raise ValueError(f"Could not load checkpoint {checkpoint_id}")
+    
+    def load_checkpoint_by_step(self, step: int) -> Dict[str, Any]:
+        """
+        Load a checkpoint by step number.
+        
+        Args:
+            step: Step number
+            
+        Returns:
+            Dictionary with checkpoint data
+        """
+        # Find checkpoints for this step in the index
+        matching_checkpoints = []
+        
+        for checkpoint_id in self.checkpoints_group.keys():
+            checkpoint_group = self.checkpoints_group[checkpoint_id]
+            if checkpoint_group.attrs.get("step") == step:
+                matching_checkpoints.append(checkpoint_id)
+        
+        if not matching_checkpoints:
+            # Try to find by tag
+            tag_name = f"checkpoint_{step}"
+            try:
+                snapshot_id = self.repo.lookup_tag(tag_name)
+                # Use snapshot_id directly
+                return self.load_checkpoint(snapshot_id)
+            except:
+                raise ValueError(f"No checkpoint found for step {step}")
+        
+        # If multiple checkpoints for this step, use the latest one
+        if len(matching_checkpoints) > 1:
+            # Sort by timestamp if available, otherwise by ID
+            latest_checkpoint = max(
+                matching_checkpoints,
+                key=lambda cid: self.checkpoints_group[cid].attrs.get("timestamp", cid)
+            )
+        else:
+            latest_checkpoint = matching_checkpoints[0]
+        
+        return self.load_checkpoint(latest_checkpoint)
+    
+    def load_latest_checkpoint(self) -> Dict[str, Any]:
+        """
+        Load the latest checkpoint.
+        
+        Returns:
+            Dictionary with checkpoint data
+        """
+        # First, try to find the latest checkpoint from the index
+        if self.checkpoints_group.keys():
+            # Find the latest checkpoint by timestamp or step
+            latest_checkpoint = None
+            latest_timestamp = None
+            latest_step = -1
+            
+            for checkpoint_id in self.checkpoints_group.keys():
+                checkpoint_group = self.checkpoints_group[checkpoint_id]
+                
+                # First try to use timestamp
+                if "timestamp" in checkpoint_group.attrs:
+                    timestamp = checkpoint_group.attrs["timestamp"]
+                    if latest_timestamp is None or timestamp > latest_timestamp:
+                        latest_timestamp = timestamp
+                        latest_checkpoint = checkpoint_id
+                # Fallback to using step
+                elif "step" in checkpoint_group.attrs:
+                    step = checkpoint_group.attrs["step"]
+                    if step > latest_step:
+                        latest_step = step
+                        latest_checkpoint = checkpoint_id
+            
+            # If found a checkpoint in the index, load it
+            if latest_checkpoint is not None:
+                return self.load_checkpoint(latest_checkpoint)
+        
+        # If no checkpoints in index or loading failed, try to find latest tag
+        checkpoint_tags = []
+        
+        # Get all tags that start with "checkpoint_"
+        for tag_name in self.created_tags:
+            if tag_name.startswith("checkpoint_"):
+                try:
+                    step = int(tag_name.split("_")[1])
+                    checkpoint_tags.append((step, tag_name))
+                except:
+                    pass
+        
+        if checkpoint_tags:
+            # Sort by step number
+            checkpoint_tags.sort(reverse=True)
+            latest_tag = checkpoint_tags[0][1]
+            
+            try:
+                # Lookup snapshot from tag
+                snapshot_id = self.repo.lookup_tag(latest_tag)
+                return self.load_checkpoint(snapshot_id)
+            except Exception as e:
+                print(f"Error loading checkpoint from tag {latest_tag}: {e}")
+        
+        # Last resort: get the current head of the main branch
+        try:
+            head_snapshot_id = self.repo.lookup_branch("main")
+            return self.load_checkpoint(head_snapshot_id)
+        except Exception as e:
+            print(f"Error loading latest snapshot: {e}")
+            raise ValueError("No checkpoints found")
+    
+    def list_checkpoints(self) -> List[Dict[str, Any]]:
+        """
+        List all available checkpoints.
+        
+        Returns:
+            List of dictionaries with checkpoint metadata
+        """
+        checkpoints = []
+        
+        # First, list checkpoints from the index
+        for checkpoint_id in self.checkpoints_group.keys():
+            try:
+                checkpoint_group = self.checkpoints_group[checkpoint_id]
+                metadata = dict(checkpoint_group.attrs)
+                metadata["id"] = checkpoint_id
+                
+                # Add snapshot ID if available
+                if "snapshot_id" in metadata:
+                    metadata["snapshot_id"] = metadata["snapshot_id"]
+                
+                checkpoints.append(metadata)
+            except Exception as e:
+                print(f"Error listing checkpoint {checkpoint_id}: {e}")
+        
+        # Also look for checkpoint tags that might not be in the index
+        checkpoint_tags = []
+        
+        # List all tags
+        try:
+            all_tags = []
+            for tag_name in self.created_tags:
+                if tag_name.startswith("checkpoint_"):
+                    all_tags.append(tag_name)
+            
+            # Look up each tag
+            for tag_name in all_tags:
+                try:
+                    snapshot_id = self.repo.lookup_tag(tag_name)
+                    
+                    # Check if this snapshot is already in our list
+                    already_included = False
+                    for checkpoint in checkpoints:
+                        if checkpoint.get("snapshot_id") == snapshot_id:
+                            already_included = True
+                            break
+                    
+                    if not already_included:
+                        # Get step from tag name
+                        step = None
+                        try:
+                            if "_" in tag_name:
+                                step = int(tag_name.split("_")[1])
+                        except:
+                            pass
+                        
+                        # Create metadata entry
+                        tag_metadata = {
+                            "id": tag_name,
+                            "snapshot_id": snapshot_id,
+                            "step": step,
+                            "from_tag": True
+                        }
+                        
+                        # Try to get more info from snapshot
+                        try:
+                            snapshot = self.repo.get_snapshot(snapshot_id)
+                            tag_metadata["timestamp"] = snapshot.written_at.isoformat()
+                            tag_metadata["message"] = snapshot.message
+                        except:
+                            pass
+                        
+                        checkpoints.append(tag_metadata)
+                except Exception as e:
+                    print(f"Error processing tag {tag_name}: {e}")
+            
+        except Exception as e:
+            print(f"Error listing checkpoint tags: {e}")
+        
+        # Sort by step, then timestamp
+        return sorted(
+            checkpoints,
+            key=lambda c: (c.get("step", 0), c.get("timestamp", ""))
+        ) 
