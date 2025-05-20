@@ -553,9 +553,9 @@ ParamLake is designed to be framework-agnostic. While the current implementation
 
 <div align="center">
   <p>
-    <a href="https://github.com/yourusername/paramlake/issues">Report Bug</a> •
-    <a href="https://github.com/yourusername/paramlake/issues">Request Feature</a> •
-    <a href="https://github.com/yourusername/paramlake/stargazers">⭐ Star Us</a>
+    <a href="https://github.com/stpnvsh/paramlake/issues">Report Bug</a> •
+    <a href="https://github.com/stprnvsh/paramlake/issues">Request Feature</a> •
+    <a href="https://github.com/stprnvsh/paramlake/stargazers">⭐ Star Us</a>
   </p>
   <p>
     <i>Made with ❤️ for the ML community</i>
