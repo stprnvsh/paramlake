@@ -49,6 +49,14 @@ class ParamLakeConfig:
             "track_method": "auto",  # "auto", "train_step", "optimizer", or "callback"
         },
         
+        # Metrics collection options
+        "metrics": {
+            "enabled": True,  # Whether to collect metrics
+            "capture_frequency": 1,  # Compute metrics every N steps
+            "compute": ["l2", "mean", "var", "max", "min", "sparsity"],  # Basic metrics
+            "advanced_compute": [],  # Optional advanced metrics (spectral_norm, etc.)
+        },
+        
         # Compression options
         "compression": {
             "algorithm": "blosc_zstd",

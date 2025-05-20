@@ -260,6 +260,17 @@ class WeightCollector:
                     tensor_data,
                     step
                 )
+                
+                # Process metrics if metrics collector is registered
+                if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                    layer_name = layer_group.attrs.get("name", layer_group.name)
+                    self.storage.metrics_collector.process_tensor(
+                        layer_name,
+                        tensor_type,
+                        name,
+                        tensor_data,
+                        step
+                    )
             except Exception as e:
                 # Print the full exception for better debugging
                 import traceback

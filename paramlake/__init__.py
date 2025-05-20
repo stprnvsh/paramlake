@@ -7,6 +7,9 @@ __version__ = "0.1.0"
 # Import main decorator
 from paramlake.decorators.model_decorator import paramlake
 
+# Import Repo class for version control
+from paramlake.repo import Repo
+
 # Import analyzers
 from paramlake.storage.zarr_analyzer import ZarrModelAnalyzer
 
@@ -22,6 +25,7 @@ except ImportError:
     
 __all__ = [
     "paramlake", 
+    "Repo",
     "ZarrModelAnalyzer", 
     "save_checkpoint", 
     "load_checkpoint", 

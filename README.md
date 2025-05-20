@@ -7,6 +7,7 @@ A comprehensive solution for tracking, storing, and analyzing deep learning mode
 - **Minimal Code Changes**: Simply add a decorator to your training function
 - **Automatic Gradient Capture**: Multiple methods for tracking gradients without manual instrumentation
 - **Comprehensive Data Collection**: Capture trainable weights, non-trainable variables, gradients, activations, and optimizer states (including configuration).
+- **Tensor Metrics**: Automatically compute and store statistics like L2 norm, mean, variance, min/max values, sparsity, and spectral norm
 - **Optimized Storage**: Specialized chunk sizes and compression strategies for different tensor types
 - **Efficient Analysis**: Tools for analyzing and visualizing model parameters, gradients, and optimizer states.
 - **Transactional Storage**: Supports Icechunk for cloud-native transactional tensor storage
@@ -46,6 +47,11 @@ from paramlake import paramlake
 #   enabled: true
 #   auto_tracking: true
 #   track_method: "auto"  # Can be "auto", "train_step", "optimizer", or "callback"
+# metrics:
+#   enabled: true
+#   capture_frequency: 1
+#   compute: ["l2", "mean", "var", "max", "min", "sparsity"]
+#   advanced_compute: ["spectral_norm"]  # For matrix tensors
 # capture_optimizer_state: true # Enable optimizer state capture
 
 # 2. Add the decorator to your training function
@@ -70,7 +76,12 @@ analyzer.plot_gradient_norm_by_layer()
 gradient_stats = analyzer.analyze_gradient_statistics()
 print(f"Gradient coverage: {gradient_stats['summary']['gradient_coverage']:.2%}")
 
-# 6. Analyze optimizer state (if captured)
+# 6. Analyze tensor metrics
+kernel_metrics = analyzer.get_tensor_metrics("dense_1", "weights", "kernel", "l2")
+print(f"L2 norm evolution: {kernel_metrics}")
+analyzer.plot_tensor_metrics("dense_1", "weights", "kernel", ["l2", "mean", "var"])
+
+# 7. Analyze optimizer state (if captured)
 optimizer_config = analyzer.get_optimizer_config()
 if optimizer_config:
     print(f"Optimizer Config: {optimizer_config}")
@@ -78,6 +89,55 @@ optimizer_state_step_0 = analyzer.get_optimizer_state(step=0)
 if optimizer_state_step_0:
     print(f"Optimizer state at step 0: {len(optimizer_state_step_0)} tensors")
 ```
+
+## Metrics Collection
+
+ParamLake automatically computes and stores key statistics about your model's tensors during training:
+
+```python
+# Configure metrics collection in your config
+@paramlake(
+    metrics={
+        "enabled": True,
+        "capture_frequency": 1,  # Every step
+        "compute": ["l2", "mean", "var", "max", "min", "sparsity"],
+        "advanced_compute": ["spectral_norm"]  # For matrix tensors (2D)
+    }
+)
+def train_model():
+    # Your training code as usual
+    model = create_model()
+    model.compile(...)
+    model.fit(...)
+    return model
+
+# Later, analyze the metrics
+analyzer = ZarrModelAnalyzer("model_data.zarr")
+
+# Get metrics for a specific tensor
+l2_norms = analyzer.get_tensor_metrics("dense_1", "weights", "kernel", "l2")
+print(f"L2 norm evolution: {l2_norms}")
+
+# Plot multiple metrics for a tensor over time
+analyzer.plot_tensor_metrics(
+    "dense_1", 
+    "weights", 
+    "kernel", 
+    ["l2", "mean", "var", "max", "min"]
+)
+
+# Get summary statistics across all metrics
+metrics_stats = analyzer.get_metrics()
+```
+
+Available metrics include:
+- **l2**: L2 norm (magnitude) of the tensor
+- **mean**: Mean value of the tensor
+- **var**: Variance of the tensor
+- **max**: Maximum value in the tensor
+- **min**: Minimum value in the tensor
+- **sparsity**: Fraction of zero values in the tensor
+- **spectral_norm**: Largest singular value (for 2D matrices only)
 
 ## Checkpointing and Model Versioning
 
@@ -203,6 +263,13 @@ gradients:
   auto_tracking: true
   track_method: "auto"  # "auto", "train_step", "optimizer", or "callback"
 
+# Metrics options
+metrics:
+  enabled: true
+  capture_frequency: 1
+  compute: ["l2", "mean", "var", "max", "min", "sparsity"]
+  advanced_compute: ["spectral_norm"]  # For matrix tensors
+
 # Layer filtering
 include_layers: ["dense*", "conv*"]  # Only include layers matching patterns
 exclude_layers: ["batch_normalization*"]  # Exclude specific layers
@@ -258,6 +325,10 @@ from paramlake import paramlake
     gradients={
         "enabled": True,
         "auto_tracking": True
+    },
+    metrics={
+        "enabled": True,
+        "compute": ["l2", "mean", "var", "max", "min", "sparsity"]
     }
 )
 def train_model():
@@ -280,6 +351,9 @@ analyzer = IcechunkModelAnalyzer({
 analyzer.plot_weight_evolution("dense/kernel")
 analyzer.plot_gradient_norm_by_layer()
 gradient_stats = analyzer.analyze_gradient_statistics()
+
+# Analyze metrics from tensors
+analyzer.plot_tensor_metrics("dense", "weights", "kernel", ["l2", "mean"])
 
 # Analyze optimizer state with Icechunk
 optimizer_config = analyzer.get_optimizer_config()
@@ -313,6 +387,13 @@ for layer_name, layer_stats in gradient_stats["layer_stats"].items():
 
 # Plot gradient norms
 analyzer.plot_gradient_norm_by_layer()
+
+# Analyze tensor metrics
+l2_norm = analyzer.get_tensor_metrics("dense_1", "weights", "kernel", "l2")
+print(f"L2 norm evolution: {l2_norm}")
+
+# Plot multiple metrics
+analyzer.plot_tensor_metrics("dense_1", "weights", "kernel", ["l2", "mean", "var"])
 
 # Compare two training runs
 analyzer.compare_runs("run1.zarr", "run2.zarr")
@@ -350,13 +431,17 @@ analyzer.plot_snapshot_comparison(
     layer_name="dense/kernel"
 )
 
-# Analyze gradients across snapshots
+# Analyze tensor metrics across snapshots
 for snapshot in history[:3]:  # Look at the latest 3 snapshots
     temp_analyzer = IcechunkModelAnalyzer({
         "type": "s3", 
         "bucket": "my-bucket", 
         "prefix": "my-training-run"
     }, snapshot_id=snapshot["id"])
+    
+    # Get metric statistics
+    l2_norms = temp_analyzer.get_tensor_metrics("dense", "weights", "kernel", "l2")
+    print(f"Snapshot {snapshot['id']}: L2 norm evolution: {l2_norms}")
     
     # Get gradient statistics
     grad_stats = temp_analyzer.analyze_gradient_statistics()

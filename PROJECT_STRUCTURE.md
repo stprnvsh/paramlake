@@ -13,7 +13,8 @@ paramlake/
 │   │   ├── __init__.py        # Package initialization
 │   │   ├── weight_collector.py     # Collect weights and parameters
 │   │   ├── gradient_collector.py   # Collect gradients during training
-│   │   └── activation_collector.py # Collect layer activations
+│   │   ├── activation_collector.py # Collect layer activations
+│   │   ├── metrics_collector.py    # Collect tensor statistics and metrics
 │   │   └── optimizer_collector.py  # Collect optimizer state and configuration
 │   ├── decorators/            # Decorator implementation
 │   │   ├── __init__.py        # Package initialization
@@ -36,7 +37,8 @@ paramlake/
 │       └── checkpoint_utils.py # Checkpoint save/load utilities
 ├── examples/                  # Example scripts
 │   ├── tensorflow_example.py  # TensorFlow example
-│   └── checkpoint_example.py  # Example for using checkpoints
+│   ├── checkpoint_example.py  # Example for using checkpoints
+│   └── test_metrics_capture.py # Example for metrics collection and analysis
 ├── README.md                  # Project README
 ├── LICENSE                    # MIT License
 ├── PROJECT_STRUCTURE.md       # This file
@@ -70,6 +72,13 @@ Collectors are responsible for gathering data from models during training:
   - Can generate sample inputs to capture activations
   - Handles capturing activations from any layer in the model
 
+- **Metrics Collector**: Computes and stores statistics for tensor data
+  - Calculates L2 norm, mean, variance, min/max values, and sparsity metrics
+  - Supports advanced metrics like spectral norm for weight matrices
+  - Efficiently processes tensors during training with minimal overhead
+  - Stores metrics in a hierarchical structure for easy retrieval and analysis
+  - Enables temporal analysis of tensor properties across training
+
 - **Optimizer Collector**: Captures optimizer state and configuration
   - Fetches optimizer weights (e.g., momentum, variance estimates)
   - Retrieves optimizer configuration (e.g., learning rate, hyperparameters)
@@ -86,6 +95,7 @@ The decorator system provides a simple interface for users:
   - Manages the collector lifecycle (initialization, collection, finalization)
   - Configures automatic gradient tracking based on user settings
   - Ensures clean restoration of original methods after training
+  - Registers metric collectors to track tensor statistics during training
 
 ### Schema
 
@@ -105,6 +115,7 @@ Storage components handle efficient storage and retrieval of data:
   - Provides a unified API for different storage backends
   - Defines methods for storing optimizer state and configuration
   - Includes methods for checkpoint save/load operations
+  - Supports metrics storage and retrieval with hierarchical paths
 
 - **Storage Factory**: Creates appropriate storage manager based on configuration
   - Dynamically selects between Zarr and Icechunk based on configuration
@@ -119,7 +130,8 @@ Storage components handle efficient storage and retrieval of data:
   - Handles both synchronous and asynchronous writes
   - Monitors memory usage for adaptive collection strategies
   - Provides specialized gradient storage with optimized chunking
-  - Implements checkpoint save/load functionality 
+  - Implements checkpoint save/load functionality
+  - Stores tensor metrics in a hierarchical structure
 
 - **Zarr Analyzer**: Provides tools for analyzing and visualizing the stored data
   - Computes statistics on weights, gradients, and activations
@@ -128,6 +140,7 @@ Storage components handle efficient storage and retrieval of data:
   - Implements lazy loading to efficiently handle large datasets
   - Retrieves and displays optimizer configuration and state
   - Provides utilities for accessing checkpoints
+  - Retrieves metrics data using hierarchical paths
 
 - **Icechunk Manager**: Manages writing data to Icechunk repositories with transactional semantics
   - Supports cloud storage backends (S3, GCS, Azure)
@@ -137,6 +150,7 @@ Storage components handle efficient storage and retrieval of data:
   - Includes gradient-specific storage optimizations
   - Stores optimizer state and configuration
   - Integrates checkpoints with Icechunk's native snapshot system
+  - Stores tensor metrics in a hierarchical structure
 
 - **Icechunk Analyzer**: Provides tools for analyzing data stored in Icechunk repositories
   - Supports efficient querying of model histories and snapshots
@@ -145,6 +159,7 @@ Storage components handle efficient storage and retrieval of data:
   - Implements analysis of gradient statistics across model layers
   - Retrieves and displays optimizer configuration and state
   - Provides access to checkpoint data in snapshots
+  - Retrieves metrics data using hierarchical paths
 
 ### Utils
 
@@ -155,6 +170,7 @@ Utility functions for configuration and other common tasks:
   - Provides validation and defaults for all configuration options
   - Supports gradient-specific configuration settings
   - Enables specialized compression and chunking for different tensor types
+  - Includes metrics collection configuration options
 
 - **Model Utils**: Utility functions for working with TensorFlow models
   - Provides functions to get all layers, including nested layers
@@ -175,6 +191,7 @@ Utility functions for configuration and other common tasks:
    - The weight collector captures layer weights
    - The gradient collector automatically captures gradients using the appropriate method
    - The activation collector captures activations (if enabled)
+   - The metrics collector computes and stores tensor statistics
    - The optimizer collector captures optimizer state and configuration (if enabled)
 4. All data is stored with optimized chunking and compression
 5. After training, the user can analyze the data using the appropriate analyzer
@@ -187,6 +204,7 @@ Configuration can be provided via YAML files or inline parameters:
 - **Basic Options**: Output path, run ID, capture frequency, what to capture
 - **Gradient Options**: Auto tracking, tracking method, specialized storage settings
 - **Optimizer Options**: Enable/disable optimizer state capture
+- **Metrics Options**: Which metrics to compute (L2 norm, mean, variance, etc.), capture frequency
 - **Layer Filtering**: Include/exclude specific layers or layer types
 - **Compression**: Algorithm, level, and tensor-type specific compression settings
 - **Chunking**: How to chunk the data for efficient storage and retrieval
@@ -205,6 +223,7 @@ Configuration can be provided via YAML files or inline parameters:
 - **Framework Compatibility**: Core schema designed to support TensorFlow, PyTorch, and JAX
 - **Efficient Data Analysis**: Lazy loading and caching for efficient analysis of large datasets
 - **Gradient Analysis Tools**: Built-in support for analyzing and visualizing gradient behavior
+- **Tensor Metrics**: Comprehensive statistics calculation for weights, gradients, and activations
 - **Optimizer Analysis Tools**: Support for retrieving and inspecting optimizer state and configuration
 - **Version Control**: History tracking and snapshot management with Icechunk
 - **Checkpointing System**: Save and restore training state to continue from specific points in training 

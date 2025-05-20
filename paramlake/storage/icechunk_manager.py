@@ -1403,4 +1403,266 @@ class IcechunkStorageManager(StorageInterface):
         return sorted(
             checkpoints,
             key=lambda c: (c.get("step", 0), c.get("timestamp", ""))
-        ) 
+        )
+
+    # --- New Git-like feature implementations ---
+
+    def get_snapshot_id_for_reference(self, reference: str) -> Optional[str]:
+        """Resolves a branch name, tag name, or snapshot ID to a snapshot ID."""
+        if not self.repo: return None
+        try: # Is it a branch?
+            return self.repo.lookup_branch(reference)
+        except icechunk.IcechunkError: # Not a branch, or error
+            pass
+        try: # Is it a tag?
+            return self.repo.lookup_tag(reference)
+        except icechunk.IcechunkError:
+            pass
+        try: # Is it a direct snapshot ID?
+            self.repo.get_snapshot(reference) # Validate if it's a snapshot ID
+            return reference
+        except icechunk.IcechunkError:
+            pass
+        print(f"Warning: Reference '{reference}' not found as a branch, tag, or snapshot ID.")
+        return None
+
+    def commit_model_state(
+        self,
+        model_parameters: Dict[str, np.ndarray],
+        message: str,
+        branch_name: str,
+        author: Optional[str] = None,
+        additional_metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Commits the model's parameters as a new snapshot on the given branch."""
+        if not self.repo: raise ConnectionError("Repository not open.")
+
+        # Ensure the branch exists, or create it from main's head if it doesn't and is not main
+        if branch_name != 'main':
+            try:
+                self.repo.lookup_branch(branch_name)
+            except icechunk.IcechunkError: # Branch does not exist
+                print(f"Branch '{branch_name}' does not exist. Creating it from main HEAD.")
+                main_head_id = self.repo.lookup_branch('main')
+                self.repo.create_branch(branch_name, snapshot_id=main_head_id)
+        
+        session = self.repo.writable_session(branch_name)
+        store = session.store
+        params_group_name = "parameters" # Define a group for model parameters
+
+        try:
+            if params_group_name not in store:
+                params_group = store.create_group(params_group_name)
+            else:
+                params_group = store[params_group_name]
+
+            for name, data in model_parameters.items():
+                # Sanitize name for Zarr
+                safe_name = name.replace("/", "_").replace(":", "_")
+                if safe_name in params_group:
+                    # Overwrite existing array
+                    params_group[safe_name][...] = data
+                else:
+                    # Create new array
+                    params_group.create_dataset(safe_name, data=data, chunks=True, compressor=None) # Icechunk handles compression
+            
+            # Add commit metadata as attributes to the snapshot (via session commit)
+            # Icechunk's commit message is the primary place. Author/timestamp are auto by Icechunk.
+            # Additional metadata can be stored in a separate metadata object if needed,
+            # or as attributes on a specific group within this snapshot if Icechunk's commit doesn't support rich metadata.
+            # For now, relying on message and Icechunk's built-in timestamp/author (if any).
+            
+            snapshot_id = session.commit(message)
+            # self._refresh_session_after_commit() # Not strictly needed after every commit if session remains usable
+                                                # but good practice if next ops might conflict.
+                                                # The design doc says IceChunk session becomes read-only.
+                                                # So, this IS needed.
+            self._refresh_session_after_commit() # To get a new writable session
+            
+            # Update current_step if this is on the main lineage of tracking
+            # This logic might be better handled at the Repo class or callback level.
+            # For now, just commit.
+            
+            return snapshot_id
+        except Exception as e:
+            session.abort() # Abort on error
+            self._refresh_session_after_commit() # Still refresh to clean up session state
+            raise RuntimeError(f"Failed to commit model state to branch '{branch_name}': {e}")
+
+    def create_branch(self, branch_name: str, from_reference: Optional[str] = None) -> None:
+        """Creates a new branch, optionally from a specific snapshot or another reference."""
+        if not self.repo: raise ConnectionError("Repository not open.")
+        
+        snapshot_id_to_branch_from = None
+        if from_reference:
+            snapshot_id_to_branch_from = self.get_snapshot_id_for_reference(from_reference)
+            if not snapshot_id_to_branch_from:
+                raise ValueError(f"Reference '{from_reference}' for branching not found.")
+        else: # Default to current HEAD of 'main' branch if no reference
+            try:
+                snapshot_id_to_branch_from = self.repo.lookup_branch('main')
+            except icechunk.IcechunkError: # If main doesn't exist (e.g. new repo, no commits yet)
+                snapshot_id_to_branch_from = self.repo.initial_snapshot().id
+
+        try:
+            self.repo.create_branch(branch_name, snapshot_id=snapshot_id_to_branch_from)
+        except icechunk.IcechunkError as e:
+            raise ValueError(f"Failed to create branch '{branch_name}': {e}")
+
+    def list_branches(self) -> List[str]:
+        """Lists all branches in the repository."""
+        if not self.repo: return []
+        try:
+            # Icechunk returns a BranchView, convert to list of names
+            return [branch.name for branch in self.repo.branches()]
+        except Exception as e:
+            print(f"Error listing branches: {e}")
+            return []
+            
+    def delete_branch(self, branch_name: str) -> None:
+        """Deletes a branch."""
+        if not self.repo: return
+        try:
+            self.repo.delete_branch(branch_name)
+        except icechunk.IcechunkError as e:
+            # Catch if branch does not exist, etc.
+            raise ValueError(f"Failed to delete branch '{branch_name}': {e}")
+
+    def create_tag(self, tag_name: str, reference: str, message: Optional[str] = None) -> None:
+        """Creates a tag pointing to a specific reference (snapshot_id, branch, or tag)."""
+        if not self.repo: raise ConnectionError("Repository not open.")
+        snapshot_id = self.get_snapshot_id_for_reference(reference)
+        if not snapshot_id:
+            raise ValueError(f"Reference '{reference}' for tagging not found.")
+        try:
+            # Icechunk tags don't have a separate message AFAIK, message is part of snapshot
+            self.repo.create_tag(tag_name, snapshot_id=snapshot_id)
+        except icechunk.IcechunkError as e:
+            raise ValueError(f"Failed to create tag '{tag_name}': {e}")
+
+    def list_tags(self) -> Dict[str, str]:
+        """Lists all tags and their associated snapshot IDs."""
+        if not self.repo: return {}
+        try:
+            # Icechunk returns a TagView, convert to dict
+            return {tag.name: tag.snapshot_id for tag in self.repo.tags()}
+        except Exception as e:
+            print(f"Error listing tags: {e}")
+            return {}
+
+    def delete_tag(self, tag_name: str) -> None:
+        """Deletes a tag."""
+        if not self.repo: return
+        try:
+            self.repo.delete_tag(tag_name)
+        except icechunk.IcechunkError as e:
+            raise ValueError(f"Failed to delete tag '{tag_name}': {e}")
+
+    def get_history(self, reference: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Gets the commit history for a given reference (branch, tag, or snapshot_id)."""
+        if not self.repo: return []
+        
+        snapshot_id_to_log = None
+        if reference:
+            snapshot_id_to_log = self.get_snapshot_id_for_reference(reference)
+            if not snapshot_id_to_log:
+                print(f"Warning: Reference '{reference}' not found. Showing history for default (main).")
+                snapshot_id_to_log = self.repo.lookup_branch('main') # Fallback
+        else: # Default to main branch HEAD
+            snapshot_id_to_log = self.repo.lookup_branch('main')
+
+        history = []
+        try:
+            ancestry = self.repo.ancestry(snapshot_id=snapshot_id_to_log)
+            count = 0
+            for ancestor_snapshot_info in ancestry:
+                if limit is not None and count >= limit:
+                    break
+                
+                # Get tags pointing to this snapshot
+                tags_for_snapshot = []
+                for tag in self.repo.tags():
+                    if tag.snapshot_id == ancestor_snapshot_info.id:
+                        tags_for_snapshot.append(tag.name)
+
+                history_entry = {
+                    "id": ancestor_snapshot_info.id,
+                    "message": ancestor_snapshot_info.message,
+                    "timestamp": ancestor_snapshot_info.written_at.isoformat() if ancestor_snapshot_info.written_at else None,
+                    "author": None, # Icechunk snapshots don't store author directly in SnapshotInfo; could be in message/metadata
+                    "tags": tags_for_snapshot
+                }
+                history.append(history_entry)
+                count += 1
+        except Exception as e:
+            print(f"Error retrieving history for '{reference}': {e}")
+        return history
+        
+    def load_parameters_from_snapshot(self, reference: str) -> Dict[str, np.ndarray]:
+        """Loads all model parameters from a given reference (snapshot ID, branch, or tag)."""
+        if not self.repo: raise ConnectionError("Repository not open.")
+        snapshot_id = self.get_snapshot_id_for_reference(reference)
+        if not snapshot_id:
+            raise ValueError(f"Reference '{reference}' not found.")
+
+        params: Dict[str, np.ndarray] = {}
+        try:
+            # Open a read-only session for the specific snapshot
+            read_session = self.repo.readonly_session(snapshot_id=snapshot_id)
+            store = read_session.store
+            params_group_name = "parameters"
+
+            if params_group_name in store:
+                params_group = store[params_group_name]
+                for name in params_group.keys():
+                    params[name] = params_group[name][...] # Load the full array
+            else:
+                print(f"Warning: No '{params_group_name}' group found in snapshot '{snapshot_id}'.")
+            return params
+        except Exception as e:
+            raise RuntimeError(f"Failed to load parameters from snapshot '{snapshot_id}': {e}")
+
+    # Stubs for future features
+    def diff_snapshots(self, snapshot_id1: str, snapshot_id2: str) -> List[Dict[str, Any]]:
+        raise NotImplementedError("Diffing snapshots is not yet implemented for IcechunkStorageManager.")
+
+    def merge_branches(
+        self, 
+        source_branch: str, 
+        target_branch: str, 
+        strategy: str = 'manual',
+        commit_message: Optional[str] = None
+    ) -> Optional[str]:
+        raise NotImplementedError("Merging branches is not yet implemented for IcechunkStorageManager.")
+
+    def import_model_from_path(
+        self, 
+        source_path: str, 
+        source_format: str, 
+        branch_name: str, 
+        commit_message: Optional[str] = None
+    ) -> str:
+        # Basic HDF5 import as a starting point
+        if source_format.lower() == 'hdf5':
+            try:
+                import h5py
+                model_params = {}
+                with h5py.File(source_path, 'r') as hf:
+                    def extract_weights(name, obj):
+                        if isinstance(obj, h5py.Dataset):
+                            # Use a sanitized version of the HDF5 path as the parameter name
+                            safe_name = name.replace("/", "_").replace(":", "_")
+                            model_params[safe_name] = obj[()] # Read numpy array
+                    hf.visititems(extract_weights)
+                
+                if not model_params:
+                    raise ValueError("No datasets found in HDF5 file or failed to extract.")
+
+                msg = commit_message or f"Import model from HDF5: {os.path.basename(source_path)}"
+                return self.commit_model_state(model_params, msg, branch_name)
+            except ImportError:
+                raise ImportError("h5py is required to import HDF5 files. pip install h5py")
+            except Exception as e:
+                raise RuntimeError(f"Failed to import HDF5 model: {e}")
+        else:
+            raise NotImplementedError(f"Import for format '{source_format}' is not yet implemented.") 

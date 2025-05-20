@@ -345,30 +345,87 @@ class ZarrModelAnalyzer:
     
     def get_metrics(
         self,
-        metric_name: Optional[str] = None,
+        metric_path: Optional[str] = None,
+        steps: Optional[Union[int, slice]] = None,
     ) -> Union[Dict[str, np.ndarray], np.ndarray]:
         """
         Get metrics data.
         
         Args:
-            metric_name: Name of the metric to retrieve.
-                        If None, returns all metrics.
+            metric_path: Path to the metric(s) to retrieve.
+                        Can be a full path like 'layer_name/tensor_type/tensor_name/metric_name'
+                        or None for all metrics.
+            steps: Step or slice to retrieve (None for all steps)
             
         Returns:
             Dictionary of metrics or a single metric array
         """
         if self.metrics_group is None:
-            return {} if metric_name is None else np.array([])
+            return {} if metric_path is None else np.array([])
         
-        if metric_name is None:
+        if metric_path is None:
+            # Return all metrics (flattened dictionary with full paths as keys)
             metrics = {}
-            for name in self.metrics_group.keys():
-                metrics[name] = self.metrics_group[name][:]
+            # Collect all metrics using a recursive helper function
+            self._collect_metrics_recursively(self.metrics_group, "", metrics)
             return metrics
         else:
-            if metric_name not in self.metrics_group:
-                raise KeyError(f"Metric {metric_name} not found")
-            return self.metrics_group[metric_name][:]
+            # Handle the case of a specific metric path
+            try:
+                # Split the path into components
+                path_components = metric_path.split("/")
+                current_group = self.metrics_group
+                
+                # Navigate through the path components
+                for component in path_components:
+                    if component in current_group:
+                        current_group = current_group[component]
+                    else:
+                        # Path component not found
+                        return np.array([])
+                
+                # Check if we reached a leaf node (actual metric array)
+                if isinstance(current_group, zarr.Array):
+                    if steps is None:
+                        return current_group[:]
+                    else:
+                        return current_group[steps]
+                else:
+                    # We're still at a group, not a leaf metric
+                    print(f"Warning: Path '{metric_path}' points to a group, not a metric array")
+                    return np.array([])
+                    
+            except Exception as e:
+                print(f"Warning: Could not read metric {metric_path}: {e}")
+                return np.array([])
+    
+    def _collect_metrics_recursively(
+        self,
+        group: zarr.Group,
+        current_path: str,
+        result_dict: Dict[str, np.ndarray]
+    ) -> None:
+        """
+        Recursively collect metrics from nested groups.
+        
+        Args:
+            group: Current Zarr group
+            current_path: Current path in the metrics hierarchy
+            result_dict: Dictionary to store results in
+        """
+        for name in group.keys():
+            full_path = f"{current_path}/{name}" if current_path else name
+            try:
+                item = group[name]
+                if isinstance(item, zarr.Array):
+                    # This is a metric array
+                    result_dict[full_path] = item[:]
+                elif isinstance(item, zarr.Group):
+                    # This is a subgroup, recurse into it
+                    self._collect_metrics_recursively(item, full_path, result_dict)
+            except Exception as e:
+                print(f"Warning: Could not read metric {full_path}: {e}")
+                result_dict[full_path] = np.array([])
     
     def get_model_summary(self) -> Dict[str, Any]:
         """
@@ -869,4 +926,141 @@ class ZarrModelAnalyzer:
             except (json.JSONDecodeError, TypeError):
                 # Otherwise, use the attribute value as is
                 config[key] = value
-        return config 
+        return config
+
+    def get_tensor_metrics(
+        self,
+        layer_name: str,
+        tensor_type: str,
+        tensor_name: str,
+        metric_name: str,
+        steps: Optional[Union[int, slice]] = None,
+    ) -> np.ndarray:
+        """
+        Get metrics data for a specific tensor.
+        
+        Args:
+            layer_name: Name of the layer
+            tensor_type: Type of tensor (weights, gradients, activations)
+            tensor_name: Name of the tensor
+            metric_name: Name of the metric (l2, mean, var, etc.)
+            steps: Step or slice to retrieve (None for all steps)
+            
+        Returns:
+            Numpy array of metric values over time
+        """
+        metric_path = f"{layer_name}/{tensor_type}/{tensor_name}/{metric_name}"
+        return self.get_metrics(metric_path, steps)
+    
+    def plot_tensor_metrics(
+        self,
+        layer_name: str,
+        tensor_type: str,
+        tensor_name: str,
+        metric_names: Union[str, List[str]],
+        steps: Optional[Union[int, slice]] = None,
+        title: Optional[str] = None,
+    ) -> None:
+        """
+        Plot metrics for a specific tensor.
+        
+        Args:
+            layer_name: Name of the layer
+            tensor_type: Type of tensor (weights, gradients, activations)
+            tensor_name: Name of the tensor
+            metric_names: Name or list of names of metrics to plot
+            steps: Step or slice to retrieve (None for all steps)
+            title: Plot title (or None for auto-generated)
+        """
+        if not HAS_MATPLOTLIB:
+            raise ImportError("Matplotlib is required for plotting. Install it with 'pip install matplotlib'.")
+            
+        if isinstance(metric_names, str):
+            metric_names = [metric_names]
+            
+        plt.figure(figsize=(10, 6))
+        
+        for metric_name in metric_names:
+            try:
+                data = self.get_tensor_metrics(layer_name, tensor_type, tensor_name, metric_name, steps)
+                plt.plot(data, label=metric_name)
+            except Exception as e:
+                print(f"Error plotting metric {metric_name}: {e}")
+        
+        if title:
+            plt.title(title)
+        else:
+            plt.title(f"Metrics for {layer_name}/{tensor_type}/{tensor_name}")
+            
+        plt.xlabel("Step")
+        plt.ylabel("Value")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.show()
+    
+    def compute_metrics_for_tensor(
+        self,
+        layer_name: str,
+        tensor_type: str,
+        tensor_name: str,
+        metrics: Optional[List[str]] = None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute metrics for a tensor from stored data.
+        
+        Args:
+            layer_name: Name of the layer
+            tensor_type: Type of tensor (weights, gradients, activations)
+            tensor_name: Name of the tensor
+            metrics: List of metrics to compute (or None for defaults)
+            
+        Returns:
+            Dictionary of metric names to arrays of values
+        """
+        # Get the tensor data
+        tensor_array = self._lazy_load_tensor(layer_name, tensor_name, tensor_type)
+        
+        # Default metrics if none specified
+        if metrics is None:
+            metrics = ["l2", "mean", "var", "max", "min", "sparsity"]
+            
+        # Initialize metrics storage
+        results = {}
+        steps = tensor_array.shape[0]
+        
+        # Compute metrics for each step
+        for step in range(steps):
+            data = tensor_array[step]
+            
+            # Compute each metric
+            if "l2" in metrics:
+                if "l2" not in results:
+                    results["l2"] = np.zeros(steps)
+                results["l2"][step] = float(np.linalg.norm(data))
+                
+            if "mean" in metrics:
+                if "mean" not in results:
+                    results["mean"] = np.zeros(steps)
+                results["mean"][step] = float(np.mean(data))
+                
+            if "var" in metrics:
+                if "var" not in results:
+                    results["var"] = np.zeros(steps)
+                results["var"][step] = float(np.var(data))
+                
+            if "max" in metrics:
+                if "max" not in results:
+                    results["max"] = np.zeros(steps)
+                results["max"][step] = float(np.max(data))
+                
+            if "min" in metrics:
+                if "min" not in results:
+                    results["min"] = np.zeros(steps)
+                results["min"][step] = float(np.min(data))
+                
+            if "sparsity" in metrics:
+                if "sparsity" not in results:
+                    results["sparsity"] = np.zeros(steps)
+                results["sparsity"][step] = float(np.mean(data == 0))
+                
+        return results 

@@ -1030,4 +1030,78 @@ class ZarrStorageManager(StorageInterface):
         return sorted(
             checkpoints,
             key=lambda c: (c.get("step", 0), c.get("timestamp", ""))
-        ) 
+        )
+
+    # --- Stub implementations for Git-like functionality ---
+    # These methods are only fully implemented in IcechunkStorageManager
+
+    def get_snapshot_id_for_reference(self, reference: str) -> Optional[str]:
+        """Stub: Resolves a branch name or tag name to a snapshot ID."""
+        return None
+    
+    def commit_model_state(
+        self,
+        model_parameters: Dict[str, np.ndarray],
+        message: str,
+        branch_name: str,
+        author: Optional[str] = None,
+        additional_metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Stub: Commits the model's parameters as a new snapshot on the given branch."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.")
+
+    def create_branch(self, branch_name: str, from_reference: Optional[str] = None) -> None:
+        """Stub: Creates a new branch, optionally from a specific snapshot."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.")
+
+    def list_branches(self) -> List[str]:
+        """Stub: Lists all branches in the repository."""
+        return []
+
+    def delete_branch(self, branch_name: str) -> None:
+        """Stub: Deletes a branch."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.")
+
+    def create_tag(self, tag_name: str, reference: str, message: Optional[str] = None) -> None:
+        """Stub: Creates a tag pointing to a specific snapshot."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.")
+
+    def list_tags(self) -> Dict[str, str]:
+        """Stub: Lists all tags and their associated snapshot IDs."""
+        return {}
+
+    def delete_tag(self, tag_name: str) -> None:
+        """Stub: Deletes a tag."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.")
+
+    def get_history(self, reference: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Stub: Gets the commit history for a given reference."""
+        return []
+
+    def load_parameters_from_snapshot(self, reference: str) -> Dict[str, np.ndarray]:
+        """Stub: Loads all model parameters from a given snapshot ID."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.")
+    
+    def diff_snapshots(self, snapshot_id1: str, snapshot_id2: str) -> List[Dict[str, Any]]:
+        """Stub: Computes the diff between two snapshots."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.")
+
+    def merge_branches(
+        self, 
+        source_branch: str, 
+        target_branch: str, 
+        strategy: str = 'manual',
+        commit_message: Optional[str] = None
+    ) -> Optional[str]:
+        """Stub: Merges the source branch into the target branch."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.")
+
+    def import_model_from_path(
+        self, 
+        source_path: str, 
+        source_format: str, 
+        branch_name: str, 
+        commit_message: Optional[str] = None
+    ) -> str:
+        """Stub: Imports a model from an external file into the repository."""
+        raise NotImplementedError("Git-like versioning is not supported in ZarrStorageManager. Use IcechunkStorageManager instead.") 

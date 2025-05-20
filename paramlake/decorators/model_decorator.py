@@ -17,6 +17,7 @@ from paramlake.collectors.activation_collector import ActivationCollector
 from paramlake.collectors.gradient_collector import GradientCollector
 from paramlake.collectors.weight_collector import WeightCollector
 from paramlake.collectors.optimizer_collector import OptimizerCollector
+from paramlake.collectors.metrics_collector import MetricsCollector
 from paramlake.storage.zarr_manager import ZarrStorageManager
 from paramlake.utils.config import ParamLakeConfig
 from paramlake.storage.factory import create_storage_manager
@@ -84,6 +85,20 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
         self.optimizer_collector = None
         if self.capture_optimizer_state:
             self.optimizer_collector = OptimizerCollector(self.storage_manager)
+            
+        # Create metrics collector
+        self.metrics_collector = None
+        if config.get("metrics", {}).get("enabled", True):
+            metrics_config = config.get("metrics", {})
+            enabled_metrics = metrics_config.get("compute", ["l2", "mean", "var", "max", "min", "sparsity"])
+            enabled_metrics += metrics_config.get("advanced_compute", [])
+            self.metrics_collector = MetricsCollector(
+                self.storage_manager,
+                enabled_metrics=enabled_metrics,
+                include_layers=include_layers,
+                exclude_layers=exclude_layers,
+                capture_frequency=metrics_config.get("capture_frequency", capture_frequency)
+            )
         
         self.sample_data = None
         self.current_epoch = 0
@@ -105,6 +120,10 @@ class ParamLakeCallback(tf.keras.callbacks.Callback):
     def on_train_begin(self, logs=None):
         # Initialize step counter
         self.storage_manager.set_step(0)
+        
+        # Register metrics collector if available
+        if self.metrics_collector:
+            self.storage_manager.register_metrics_collector(self.metrics_collector)
         
         # CRITICAL FIX: Create sample data if we don't have it
         if self.sample_data is None:

@@ -287,6 +287,16 @@ class ActivationCollector:
                                 activation_numpy,
                                 step
                             )
+                            
+                            # Process metrics if metrics collector is registered
+                            if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                                self.storage.metrics_collector.process_tensor(
+                                    layer_name,
+                                    "activations",
+                                    "activation",
+                                    activation_numpy,
+                                    step
+                                )
                         except Exception as e:
                             import traceback
                             print(f"Error storing activation for layer {layer_name}:")
@@ -352,6 +362,16 @@ class ActivationCollector:
                                 activation_numpy,
                                 step
                             )
+                            
+                            # Process metrics if metrics collector is registered
+                            if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                                self.storage.metrics_collector.process_tensor(
+                                    layer_name,
+                                    "activations",
+                                    "activation",
+                                    activation_numpy,
+                                    step
+                                )
                         except Exception as e:
                             import traceback
                             print(f"Error storing activation for layer {layer_name}:")
@@ -524,6 +544,16 @@ class ActivationCollector:
                             "activations",
                             step
                         )
+                        
+                        # Process metrics if metrics collector is registered
+                        if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                            self.storage.metrics_collector.process_tensor(
+                                layer_name,
+                                "activations",
+                                "activation",
+                                tensor_data_pairs[0][1],
+                                step
+                            )
                     except Exception as e:
                         import traceback
                         print(f"Error storing activations for layer {layer_name}:")
@@ -599,6 +629,16 @@ class ActivationCollector:
                                 "activations",
                                 step
                             )
+                            
+                            # Process metrics if metrics collector is registered
+                            if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                                self.storage.metrics_collector.process_tensor(
+                                    layer_name,
+                                    "activations",
+                                    "activation",
+                                    tensor_data_pairs[0][1],
+                                    step
+                                )
                         except Exception as e:
                             import traceback
                             print(f"Error storing activations for layer {layer_name}:")

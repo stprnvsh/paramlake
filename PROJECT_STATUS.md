@@ -32,11 +32,13 @@ The package has been configured for PyPI publication with the following:
 - **Visualization**: matplotlib, seaborn
 
 ## Recent Updates
+- **Metrics Collection**: Added metrics collector for computing and storing tensor statistics (L2 norm, mean, variance, min/max, sparsity, spectral norm)
+- **Hierarchical Metrics Storage**: Improved storage and retrieval of metrics with hierarchical path structure
 - **Gradient Improvements**: Enhanced gradient capture with better support for large sparse gradients and batch processing
 - **Optimizer Collection**: Added collection of optimizer state and configuration
 - **Checkpoint System**: Added ability to save and load model checkpoints for resuming training
-- **Storage Enhancements**: Updated storage managers to handle checkpoints in both Zarr and IceChunk backends
-- **Examples**: Added checkpoint example to demonstrate saving and loading model state
+- **Storage Enhancements**: Updated storage managers to handle metrics and checkpoints in both Zarr and IceChunk backends
+- **Examples**: Added metrics capture example to demonstrate collecting and analyzing tensor statistics
 
 ## Publishing Notes
 The package is configured to be published to PyPI using the following commands:
@@ -52,4 +54,4 @@ python -m twine upload dist/*
 ```
 
 ## Last Update
-This file was last updated on: 2023-05-14 # Reflects recent addition of checkpoint functionality 
+This file was last updated on: 2023-05-21 # Reflects recent addition of metrics collection system 

@@ -4,6 +4,7 @@ Factory functions for creating storage managers.
 
 from typing import Optional
 
+from paramlake.collectors.metrics_collector import MetricsCollector
 from paramlake.utils.config import ParamLakeConfig
 from paramlake.storage.storage_interface import StorageInterface
 from paramlake.storage.zarr_manager import ZarrStorageManager
@@ -36,20 +37,38 @@ def create_storage_manager(config: ParamLakeConfig) -> StorageInterface:
         
     print(f"Creating storage manager of type: {storage_type}")
     
+    storage_manager = None
+    
     if storage_type == "icechunk":
         if not HAS_ICECHUNK:
             raise ImportError("Icechunk storage requested but icechunk is not installed. "
                              "Install it with 'pip install icechunk'")
         print("Creating IcechunkStorageManager")
-        manager = IcechunkStorageManager(config)
-        print(f"Created IcechunkStorageManager with run_id: {manager.run_id}")
-        return manager
+        storage_manager = IcechunkStorageManager(config)
+        print(f"Created IcechunkStorageManager with run_id: {storage_manager.run_id}")
     else:
         # Default to Zarr
         print("Creating ZarrStorageManager")
-        manager = ZarrStorageManager(config)
-        print(f"Created ZarrStorageManager with run_id: {manager.run_id}")
-        return manager
+        storage_manager = ZarrStorageManager(config)
+        print(f"Created ZarrStorageManager with run_id: {storage_manager.run_id}")
+    
+    # Create and register metrics collector if enabled
+    if config.get("metrics", {}).get("enabled", True):
+        print("Creating MetricsCollector")
+        metrics_config = config.get("metrics", {})
+        enabled_metrics = metrics_config.get("compute", ["l2", "mean", "var", "max", "min", "sparsity"])
+        enabled_metrics += metrics_config.get("advanced_compute", [])
+        metrics_collector = MetricsCollector(
+            storage_manager,
+            enabled_metrics=enabled_metrics,
+            include_layers=config.get("include_layers"),
+            exclude_layers=config.get("exclude_layers"),
+            capture_frequency=metrics_config.get("capture_frequency", config.get("capture_frequency", 1))
+        )
+        storage_manager.register_metrics_collector(metrics_collector)
+        print("Registered MetricsCollector with storage manager")
+    
+    return storage_manager
 
 
 def get_storage_manager_class(storage_type: str) -> type:

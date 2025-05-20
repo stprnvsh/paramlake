@@ -224,6 +224,16 @@ class GradientCollector:
                             step
                         )
                         
+                        # Process metrics if metrics collector is registered
+                        if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                            self.storage.metrics_collector.process_tensor(
+                                layer_name,
+                                "gradients",
+                                tensor_name,
+                                grad_numpy,
+                                step
+                            )
+                        
                         # Mark that we stored at least one gradient
                         gradients_stored = True
                     except Exception as e:
@@ -247,6 +257,16 @@ class GradientCollector:
                                     grad_numpy,
                                     step
                                 )
+                                
+                                # Process metrics for alternate storage
+                                if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                                    self.storage.metrics_collector.process_tensor(
+                                        layer_name,
+                                        "gradients",
+                                        new_tensor_name,
+                                        grad_numpy,
+                                        step
+                                    )
                                 
                                 print(f"Successfully stored with alternate name: {new_tensor_name}")
                                 # Mark that we stored at least one gradient
