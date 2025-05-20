@@ -1,36 +1,90 @@
-# ParamLake
+<div align="center">
+  
+# 🚀 ParamLake
 
-A comprehensive solution for tracking, storing, and analyzing deep learning model parameters, gradients, and activations during training. ParamLake uses advanced storage technologies for efficient management of model data.
+<img src="https://img.shields.io/badge/Version-0.1.1-blue.svg" alt="Version"/>
+<img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"/>
+<img src="https://img.shields.io/badge/Python-3.7%20|%203.8%20|%203.9%20|%203.10-blue.svg" alt="Python versions"/>
 
-## Features
+**Track, Store, and Analyze AI Model Internals with Precision**
 
-- **Minimal Code Changes**: Simply add a decorator to your training function
-- **Automatic Gradient Capture**: Multiple methods for tracking gradients without manual instrumentation
-- **Comprehensive Data Collection**: Capture trainable weights, non-trainable variables, gradients, activations, and optimizer states (including configuration).
-- **Tensor Metrics**: Automatically compute and store statistics like L2 norm, mean, variance, min/max values, sparsity, and spectral norm
-- **Optimized Storage**: Specialized chunk sizes and compression strategies for different tensor types
-- **Efficient Analysis**: Tools for analyzing and visualizing model parameters, gradients, and optimizer states.
-- **Transactional Storage**: Supports Icechunk for cloud-native transactional tensor storage
-- **Framework Agnostic Design**: Core schema designed to work across TensorFlow, PyTorch, and JAX (TensorFlow implementation provided)
-- **Flexible Configuration**: YAML-based configuration for customizing what and how data is collected
-- **Production Ready**: Optimized for minimal training overhead while providing comprehensive parameter tracking
-- **Checkpointing**: Save and restore model weights and optimizer states to resume training from specific points
-- **Version Control for AI Models**: Like Git for AI models - save snapshots of your model and restore to any point in training history
+*Version control for your model's soul - capture every weight, gradient, and activation during training*
 
-## Installation
+[Installation](#-installation) • [Quick Start](#-quick-start) • [Features](#-features) • [Documentation](#-documentation) • [Examples](#-examples)
+</div>
+
+---
+
+<p align="center">
+  <i>ParamLake records the invisible journey of your deep learning model through training, creating a time machine for AI experimentation.</i>
+</p>
+
+<div align="center">
+  <img width="80%" src="https://img.shields.io/badge/%F0%9F%93%8A%20Visualization%20Diagram%20Placeholder-Add%20your%20diagram%20here-lightgrey" alt="Visualization Diagram Placeholder"/>
+</div>
+
+## 🌟 Features
+
+<table>
+  <tr>
+    <td width="50%">
+      <h3>🧠 Comprehensive Tracking</h3>
+      <ul>
+        <li>Capture <b>weights</b>, <b>gradients</b>, <b>activations</b> & <b>optimizer states</b></li>
+        <li>Minimal code changes - just add a decorator!</li>
+        <li>Automatic gradient capture without instrumentation</li>
+      </ul>
+    </td>
+    <td width="50%">
+      <h3>📊 Advanced Metrics</h3>
+      <ul>
+        <li>Automatic tensor statistics (L2 norm, sparsity, etc.)</li>
+        <li>Performance impact tracking</li>
+        <li>Training flow visualization</li>
+      </ul>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <h3>💾 Optimized Storage</h3>
+      <ul>
+        <li>Tensor-specialized chunking & compression</li>
+        <li>Cloud-native with Icechunk integration</li>
+        <li>Git-like versioning for AI models</li>
+      </ul>
+    </td>
+    <td>
+      <h3>🔍 Deep Analysis</h3>
+      <ul>
+        <li>Visualize weight evolution & gradient behavior</li>
+        <li>Compare training runs with precision</li>
+        <li>Time-travel through model versions</li>
+      </ul>
+    </td>
+  </tr>
+</table>
+
+- **Framework Agnostic Core** - Architecture designed for TensorFlow, PyTorch, and JAX
+- **Production Ready** - Minimal training overhead with asynchronous writing and memory adaptation
+- **Flexible Configuration** - YAML-based settings to customize everything
+- **Checkpointing** - Save and restore from any point in training history
+
+## 💻 Installation
+
+Choose the installation that fits your needs:
 
 ```bash
-# Basic installation
+# 🔋 Basic installation
 pip install paramlake
 
-# With Icechunk support (for transactional cloud storage)
+# ☁️ With Icechunk support (for transactional cloud storage)
 pip install paramlake icechunk
 
-# With visualization support
+# 📈 With visualization support
 pip install paramlake matplotlib
 ```
 
-## Quick Start
+## 🚀 Quick Start
 
 ```python
 import tensorflow as tf
@@ -90,7 +144,11 @@ if optimizer_state_step_0:
     print(f"Optimizer state at step 0: {len(optimizer_state_step_0)} tensors")
 ```
 
-## Metrics Collection
+## 📊 Metrics Collection
+
+<div align="center">
+  <img width="70%" src="https://img.shields.io/badge/%F0%9F%93%88%20Metrics%20visualization%20placeholder-Add%20your%20metrics%20chart%20here-lightgrey" alt="Metrics Visualization Placeholder"/>
+</div>
 
 ParamLake automatically computes and stores key statistics about your model's tensors during training:
 
@@ -130,7 +188,9 @@ analyzer.plot_tensor_metrics(
 metrics_stats = analyzer.get_metrics()
 ```
 
-Available metrics include:
+<details>
+<summary><b>📋 Available metrics include:</b></summary>
+
 - **l2**: L2 norm (magnitude) of the tensor
 - **mean**: Mean value of the tensor
 - **var**: Variance of the tensor
@@ -138,8 +198,13 @@ Available metrics include:
 - **min**: Minimum value in the tensor
 - **sparsity**: Fraction of zero values in the tensor
 - **spectral_norm**: Largest singular value (for 2D matrices only)
+</details>
 
-## Checkpointing and Model Versioning
+## 🔄 Checkpointing and Model Versioning
+
+<div align="center">
+  <img width="70%" src="https://img.shields.io/badge/%F0%9F%94%84%20Version%20control%20diagram%20placeholder-Add%20your%20version%20flow%20diagram%20here-lightgrey" alt="Version Control Diagram Placeholder"/>
+</div>
 
 ParamLake provides Git-like functionality for AI models, allowing you to save checkpoints and resume training from any point:
 
@@ -210,7 +275,11 @@ new_model.fit(x_train, y_train, epochs=5, initial_epoch=5)
 
 With IceChunk storage, checkpoints are integrated with snapshot functionality for seamless version control of model training.
 
-## Automatic Gradient Capture
+## 📈 Automatic Gradient Capture
+
+<div align="center">
+  <img width="70%" src="https://img.shields.io/badge/%F0%9F%93%89%20Gradient%20capture%20visualization-Add%20gradient%20flow%20diagram%20here-lightgrey" alt="Gradient Capture Visualization Placeholder"/>
+</div>
 
 ParamLake provides multiple methods to automatically capture gradients during training:
 
@@ -239,15 +308,25 @@ def train_model():
     return model
 ```
 
-The available gradient tracking methods are:
+<details>
+<summary><b>🛠️ Available gradient tracking methods:</b></summary>
+
 - **"auto"**: Automatically detect and use the best method for the model
 - **"train_step"**: Override the model's train_step method
 - **"optimizer"**: Override the optimizer's apply_gradients method
 - **"callback"**: Use a callback-based approach with GradientTape
+</details>
 
-## Configuration Options
+## ⚙️ Configuration Options
+
+<div align="center">
+  <code>📝 YAML Configuration</code>
+</div>
 
 ParamLake can be configured through a YAML file or by passing parameters directly to the decorator:
+
+<details open>
+<summary><b>Sample Configuration</b></summary>
 
 ```yaml
 # Basic options
@@ -293,8 +372,13 @@ chunking:
   target_chunk_size: 1048576  # Target chunk size in bytes (1MB)
   gradient_chunk_size: 524288  # Smaller chunks for gradients (512KB)
 ```
+</details>
 
-## Cloud Storage with Icechunk
+## ☁️ Cloud Storage with Icechunk
+
+<div align="center">
+  <img width="70%" src="https://img.shields.io/badge/%E2%98%81%EF%B8%8F%20Cloud%20storage%20visualization-Add%20cloud%20architecture%20diagram%20here-lightgrey" alt="Cloud Storage Visualization Placeholder"/>
+</div>
 
 ParamLake supports [Icechunk](https://icechunk.io), a transactional storage engine for tensor data designed for cloud object storage. This provides:
 
@@ -361,9 +445,13 @@ if optimizer_config:
     print(f"Optimizer Config for snapshot {analyzer.snapshot_id}: {optimizer_config}")
 ```
 
-## Analyzing the Data
+## 🔍 Analyzing the Data
 
-ParamLake provides utilities for analyzing the collected data:
+<div align="center">
+  <img width="70%" src="https://img.shields.io/badge/%F0%9F%94%8D%20Analysis%20visualization-Add%20analysis%20dashboard%20image%20here-lightgrey" alt="Analysis Visualization Placeholder"/>
+</div>
+
+ParamLake provides powerful utilities for analyzing the collected data:
 
 ```python
 from paramlake import ZarrModelAnalyzer
@@ -453,10 +541,23 @@ for snapshot in history[:3]:  # Look at the latest 3 snapshots
         print(f"Snapshot {snapshot['id']}: Optimizer Config: {opt_config_snap}")
 ```
 
-## Extensibility
+## 🔌 Extensibility
 
 ParamLake is designed to be framework-agnostic. While the current implementation focuses on TensorFlow, the schema and storage mechanism are designed to support other frameworks like PyTorch and JAX.
 
-## License
+## 📜 License
 
-MIT License
+[MIT License](LICENSE)
+
+---
+
+<div align="center">
+  <p>
+    <a href="https://github.com/yourusername/paramlake/issues">Report Bug</a> •
+    <a href="https://github.com/yourusername/paramlake/issues">Request Feature</a> •
+    <a href="https://github.com/yourusername/paramlake/stargazers">⭐ Star Us</a>
+  </p>
+  <p>
+    <i>Made with ❤️ for the ML community</i>
+  </p>
+</div>
