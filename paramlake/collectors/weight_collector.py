@@ -1,5 +1,5 @@
 """
-Weight collector for TensorFlow models.
+Weight collector for TensorFlow models with git-like version control integration.
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -12,37 +12,52 @@ import tensorflow as tf
 
 from paramlake.storage.storage_interface import StorageInterface
 from paramlake.utils.model_utils import get_all_layers, process_tensors_batch
+from paramlake.utils.config import ParamLakeConfig
 
 
 class WeightCollector:
-    """Collects weights from TensorFlow models."""
+    """
+    Collector for model weights with git-aware features.
+    """
 
     def __init__(
         self,
         storage_manager: StorageInterface,
-        capture_trainable: bool = True,
-        capture_non_trainable: bool = True,
-        include_layers: Optional[List[str]] = None,
-        exclude_layers: Optional[List[str]] = None,
-        include_types: Optional[List[str]] = None,
+        config: Optional[ParamLakeConfig] = None,
+        track_layers: Optional[List[str]] = None,
+        ignore_layers: Optional[List[str]] = None,
     ):
         """
-        Initialize weight collector.
-        
+        Initialize the weight collector.
+
         Args:
-            storage_manager: Storage manager that implements StorageInterface
-            capture_trainable: Whether to capture trainable weights
-            capture_non_trainable: Whether to capture non-trainable weights
-            include_layers: List of layer name patterns to include
-            exclude_layers: List of layer name patterns to exclude
-            include_types: List of layer type patterns to include
+            storage_manager: Storage manager instance
+            config: Configuration object
+            track_layers: Specific layers to track (if None, tracks all)
+            ignore_layers: Layers to ignore
         """
-        self.storage = storage_manager
-        self.capture_trainable = capture_trainable
-        self.capture_non_trainable = capture_non_trainable
-        self.include_layers = include_layers
-        self.exclude_layers = exclude_layers
-        self.include_types = include_types
+        self.storage_manager = storage_manager
+        self.config = config or ParamLakeConfig()
+        self.track_layers = track_layers
+        self.ignore_layers = ignore_layers or []
+
+        # Git integration settings
+        git_config = self.config.get("git", {}) if self.config else {}
+        self.git_enabled = git_config.get("enabled", True)
+        self.branch_aware = git_config.get("branch_aware_collection", True)
+        
+        # Collection settings
+        collector_config = self.config.get("collectors", {}).get("weights", {}) if self.config else {}
+        self.collection_frequency = collector_config.get("frequency", 1)
+        self.track_gradients = collector_config.get("track_gradients", False)
+        
+        # Weight capture settings
+        self.capture_trainable = collector_config.get("capture_trainable", True)
+        self.capture_non_trainable = collector_config.get("capture_non_trainable", False)
+        
+        # Track collection state
+        self.last_collection_epoch = -1
+        self.current_branch = "main"
         
         # Memory monitoring
         self.memory_threshold = 80  # percent
@@ -55,6 +70,227 @@ class WeightCollector:
         self.total_model_size = 0  # Total size of model parameters in bytes
         self.large_layer_threshold = 10 * 1024 * 1024  # 10MB
     
+    def should_collect(self, epoch: int) -> bool:
+        """
+        Determine if we should collect weights at this epoch.
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            True if should collect
+        """
+        # Always collect on the first epoch
+        if epoch == 0:
+            return True
+            
+        # Check frequency
+        if (epoch + 1) % self.collection_frequency != 0:
+            return False
+            
+        # Avoid duplicate collection
+        return epoch != self.last_collection_epoch
+
+    def on_train_begin(self, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+        """Called at the beginning of training."""
+        # Detect current branch if git is enabled
+        if self.git_enabled and hasattr(self.storage_manager, 'get_current_branch'):
+            try:
+                self.current_branch = self.storage_manager.get_current_branch() or "main"
+            except Exception:
+                self.current_branch = "main"
+
+        # Store initial model architecture metadata
+        if hasattr(self.storage_manager, 'store_model_metadata'):
+            try:
+                metadata = {
+                    'model_name': model.name if hasattr(model, 'name') else 'model',
+                    'num_layers': len(model.layers),
+                    'total_params': model.count_params() if hasattr(model, 'count_params') else 0,
+                    'git_branch': self.current_branch,
+                    'collection_frequency': self.collection_frequency
+                }
+                self.storage_manager.store_model_metadata(metadata)
+            except Exception as e:
+                print(f"Warning: Could not store model metadata: {e}")
+
+    def on_epoch_begin(self, epoch: int, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+        """Called at the beginning of each epoch."""
+        # Update current branch if it might have changed
+        if self.git_enabled and hasattr(self.storage_manager, 'get_current_branch'):
+            try:
+                self.current_branch = self.storage_manager.get_current_branch() or "main"
+            except Exception:
+                pass
+
+    def on_epoch_end(self, epoch: int, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+        """Called at the end of each epoch."""
+        if self.should_collect(epoch):
+            self.collect_weights(model, epoch, logs)
+            self.last_collection_epoch = epoch
+
+    def collect_weights(self, model: tf.keras.Model, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Collect model weights with git-aware metadata.
+        
+        Args:
+            model: TensorFlow model
+            epoch: Current epoch
+            logs: Training logs
+        """
+        try:
+            # Collect weights from each layer
+            for layer in model.layers:
+                if self._should_track_layer(layer):
+                    self._collect_layer_weights(layer, epoch, logs)
+                    
+            # Store git metadata with weights
+            if self.git_enabled:
+                self._store_git_metadata(epoch, logs)
+                
+        except Exception as e:
+            print(f"Error collecting weights at epoch {epoch}: {e}")
+            if self.config and self.config.get("verbose", False):
+                import traceback
+                traceback.print_exc()
+
+    def _should_track_layer(self, layer: tf.keras.layers.Layer) -> bool:
+        """
+        Determine if a layer should be tracked.
+        
+        Args:
+            layer: TensorFlow layer
+            
+        Returns:
+            True if should track
+        """
+        layer_name = layer.name
+        
+        # Check ignore list
+        if layer_name in self.ignore_layers:
+            return False
+            
+        # Check specific tracking list
+        if self.track_layers is not None:
+            return layer_name in self.track_layers
+            
+        # Default: track layers with weights
+        return len(layer.weights) > 0
+
+    def _collect_layer_weights(self, layer: tf.keras.layers.Layer, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Collect weights from a specific layer.
+        
+        Args:
+            layer: TensorFlow layer
+            epoch: Current epoch
+            logs: Training logs
+        """
+        try:
+            layer_group = self.storage_manager.create_or_get_layer_group(layer.name, layer.__class__.__name__)
+            
+            # Store each weight tensor
+            for i, weight in enumerate(layer.weights):
+                weight_name = f"weight_{i}" if len(layer.weights) > 1 else "weights"
+                weight_data = weight.numpy()
+                
+                # Add git-aware metadata
+                if self.git_enabled:
+                    weight_metadata = {
+                        'git_branch': self.current_branch,
+                        'collection_epoch': epoch,
+                        'weight_index': i,
+                        'weight_shape': weight_data.shape,
+                        'layer_type': layer.__class__.__name__
+                    }
+                    
+                    # Store metadata if supported
+                    if hasattr(self.storage_manager, 'store_tensor_metadata'):
+                        self.storage_manager.store_tensor_metadata(
+                            layer_group, weight_name, weight_metadata
+                        )
+                
+                # Store the weight tensor
+                self.storage_manager.store_tensor(
+                    layer_group=layer_group,
+                    tensor_name=weight_name,
+                    tensor_type="weights",
+                    tensor_data=weight_data,
+                    step=epoch
+                )
+                
+        except Exception as e:
+            print(f"Error collecting weights for layer {layer.name}: {e}")
+            if self.config and self.config.get("verbose", False):
+                import traceback
+                traceback.print_exc()
+
+    def _store_git_metadata(self, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Store git-related metadata for this collection.
+        
+        Args:
+            epoch: Current epoch
+            logs: Training logs
+        """
+        try:
+            git_metadata = {
+                'collection_epoch': epoch,
+                'git_branch': self.current_branch,
+                'collection_timestamp': self._get_current_timestamp(),
+                'collector_type': 'weights'
+            }
+            
+            # Add training logs if available
+            if logs:
+                git_metadata['training_logs'] = {k: float(v) if isinstance(v, (int, float, np.number)) else str(v) 
+                                                for k, v in logs.items()}
+            
+            # Store in git metadata if supported
+            if hasattr(self.storage_manager, 'store_git_collection_metadata'):
+                self.storage_manager.store_git_collection_metadata('weights', git_metadata, epoch)
+                
+        except Exception as e:
+            print(f"Warning: Could not store git metadata: {e}")
+
+    def _get_current_timestamp(self) -> str:
+        """Get current timestamp as string."""
+        try:
+            from datetime import datetime
+            return datetime.now().isoformat()
+        except Exception:
+            return "unknown"
+
+    def on_batch_end(self, batch: int, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+        """Called at the end of each batch."""
+        # Weight collection typically happens at epoch level, not batch level
+        pass
+
+    def on_train_end(self, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+        """Called at the end of training."""
+        # Final collection if needed
+        if hasattr(self, 'last_collection_epoch'):
+            current_epoch = getattr(self.storage_manager, 'current_step', 0)
+            if current_epoch > self.last_collection_epoch:
+                self.collect_weights(model, current_epoch, logs)
+
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about weight collection.
+        
+        Returns:
+            Dictionary with collection statistics
+        """
+        return {
+            'collector_type': 'weights',
+            'git_enabled': self.git_enabled,
+            'current_branch': self.current_branch,
+            'collection_frequency': self.collection_frequency,
+            'last_collection_epoch': self.last_collection_epoch,
+            'tracked_layers': len(self.track_layers) if self.track_layers else 'all',
+            'ignored_layers': len(self.ignore_layers)
+        }
+
     def should_capture_layer(self, layer: tf.keras.layers.Layer) -> bool:
         """
         Determine if a layer should be captured based on configuration.
@@ -69,21 +305,18 @@ class WeightCollector:
         layer_type = layer.__class__.__name__
         
         # Check if layer is in exclude list
-        if self.exclude_layers:
-            import fnmatch
-            if any(fnmatch.fnmatch(layer_name, pattern) for pattern in self.exclude_layers):
+        if self.ignore_layers:
+            if layer_name in self.ignore_layers:
                 return False
         
         # Check if layer is in include list (if provided)
-        if self.include_layers:
-            import fnmatch
-            if not any(fnmatch.fnmatch(layer_name, pattern) for pattern in self.include_layers):
+        if self.track_layers:
+            if layer_name not in self.track_layers:
                 return False
         
         # Check if layer type is in include types list (if provided)
-        if self.include_types:
-            import fnmatch
-            if not any(fnmatch.fnmatch(layer_type, pattern) for pattern in self.include_types):
+        if self.config.get("collectors", {}).get("weights", {}).get("include_types", []):
+            if not any(fnmatch.fnmatch(layer_type, pattern) for pattern in self.config.get("collectors", {}).get("weights", {}).get("include_types", [])):
                 return False
         
         # Default to capturing all layers
@@ -168,7 +401,7 @@ class WeightCollector:
             return
             
         # Create a layer group
-        layer_group = self.storage.create_or_get_layer_group(layer_name, layer_type)
+        layer_group = self.storage_manager.create_or_get_layer_group(layer_name, layer_type)
         
         # Store metadata if it's the first time
         if "input_shape" not in layer_group.attrs:
@@ -252,22 +485,25 @@ class WeightCollector:
                 tensor_size = self._estimate_tensor_size(tensor_data)
                 layer_size += tensor_size
                 
+                # Use layer-specific tensor name to avoid conflicts
+                unique_tensor_name = f"{layer_group.name}/{name}"
+                
                 # Store in Zarr
-                self.storage.store_tensor(
+                self.storage_manager.store_tensor(
                     layer_group,
-                    name,
+                    unique_tensor_name,
                     tensor_type,
                     tensor_data,
                     step
                 )
                 
                 # Process metrics if metrics collector is registered
-                if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                if hasattr(self.storage_manager, 'metrics_collector') and self.storage_manager.metrics_collector is not None:
                     layer_name = layer_group.attrs.get("name", layer_group.name)
-                    self.storage.metrics_collector.process_tensor(
+                    self.storage_manager.metrics_collector.process_tensor(
                         layer_name,
                         tensor_type,
-                        name,
+                        unique_tensor_name,
                         tensor_data,
                         step
                     )
@@ -329,7 +565,7 @@ class WeightCollector:
             pass
         
         # Store metadata
-        self.storage.store_layer_metadata(layer_group, metadata)
+        self.storage_manager.store_layer_metadata(layer_group, metadata)
     
     def capture_model_weights(
         self,
@@ -430,7 +666,7 @@ class WeightCollector:
             return
         
         # Create a layer group
-        layer_group = self.storage.create_or_get_layer_group(layer_name, layer_type)
+        layer_group = self.storage_manager.create_or_get_layer_group(layer_name, layer_type)
         
         # Store metadata if it's the first time
         if "input_shape" not in layer_group.attrs:
@@ -465,8 +701,9 @@ class WeightCollector:
                 tensor_size = self._estimate_tensor_size(tensor_data)
                 layer_size += tensor_size
                 
-                # Add to batch
-                tensor_data_pairs.append((name, tensor_data))
+                # Add to batch - use layer-specific tensor name to avoid conflicts
+                unique_tensor_name = f"{layer_name}/{name}"
+                tensor_data_pairs.append((unique_tensor_name, tensor_data))
             except Exception as e:
                 import traceback
                 print(f"Error processing tensor {name} for layer {layer_group.name}:")
@@ -474,7 +711,7 @@ class WeightCollector:
         
         # Store the batch of tensors
         successful_writes = process_tensors_batch(
-            self.storage, 
+            self.storage_manager, 
             layer_group, 
             tensor_data_pairs, 
             tensor_type, 

@@ -9,8 +9,8 @@ from paramlake import paramlake, IcechunkModelAnalyzer
 
 # Set up AWS credentials (for example purposes only - in practice use environment variables)
 # IMPORTANT: Replace these with your own credentials or preferably set as environment variables
-os.environ["AWS_ACCESS_KEY_ID"] = "YOUR_ACCESS_KEY"  # Replace with your own or use environment variables
-os.environ["AWS_SECRET_ACCESS_KEY"] = "YOUR_SECRET_KEY"  # Replace with your own or use environment variables
+os.environ["AWS_ACCESS_KEY_ID"] = "your_aws_access_key_id"  # Replace with your own or use environment variables
+os.environ["AWS_SECRET_ACCESS_KEY"] = "your_aws_secret_access_key"  # Replace with your own or use environment variables
 os.environ["AWS_S3_ENDPOINT"] = "https://s3.amazonaws.com"
 
 # Example model creation function
@@ -74,7 +74,7 @@ def load_mnist():
     prefix="pranavsateesh7",  # Updated prefix to avoid conflicts
     region="us-east-1",
     endpoint_url="https://s3.amazonaws.com",
-    create_repo=True,  # Create the repo if it doesn't exist
+    create_repo=False,  # Open existing repo instead of creating new one
     run_id="test_run_2",
     
     # Icechunk configuration
@@ -109,7 +109,7 @@ def train_model(paramlake_callback=None):
     model.fit(
         x_train[:100],  # Using a tiny subset for faster demonstration
         y_train[:100],
-        epochs=20,       # Just a few epochs for testing
+        epochs=15,       # 15 epochs for testing with commit every 5 epochs
         batch_size=32,
         validation_data=(x_test[:20], y_test[:20]),
         verbose=1,
@@ -160,9 +160,9 @@ def analyze_training():
             for i, snapshot in enumerate(history[:5]):  # Show first 5 snapshots
                 print(f"  {i+1}. ID: {snapshot['id'][:8]}..., Message: {snapshot['message']}")
             
-            # With commit_frequency=5 and epochs=20, we should expect 4 snapshots
-            expected_snapshots = 20 // 5
-            print(f"\nExpected number of weight snapshots: {expected_snapshots} (every 5 epochs for 20 epochs)")
+            # With commit_frequency=5 and epochs=15, we should expect 3 snapshots
+            expected_snapshots = 15 // 5
+            print(f"\nExpected number of weight snapshots: {expected_snapshots} (every 5 epochs for 15 epochs)")
             
             # Count tensors by type for each layer
             tensor_counts = {}

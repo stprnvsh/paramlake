@@ -13,8 +13,7 @@ from datetime import datetime
 
 import numpy as np
 import zarr
-from numcodecs import Zstd
-from zarr.codecs import Blosc
+from numcodecs import Zstd, Blosc
 
 from paramlake.utils.config import ParamLakeConfig
 from paramlake.storage.storage_interface import StorageInterface
@@ -134,7 +133,7 @@ class ZarrStorageManager(StorageInterface):
             tensor_type: Type of tensor (weights, gradients, activations, etc.)
             
         Returns:
-            Compressor object or None
+            List of compressor objects or None (compatible with Zarr v3)
         """
         compression = self.config.get("compression", {})
         algorithm = compression.get("algorithm", "blosc_lz4")
@@ -152,14 +151,14 @@ class ZarrStorageManager(StorageInterface):
             # Extract blosc variant if specified, use lz4 by default
             cname = algorithm.split("_")[1] if "_" in algorithm else "lz4"
             shuffle_mode = 1 if shuffle else 0
-            return Blosc(cname=cname, clevel=level, shuffle=shuffle_mode)
+            return [Blosc(cname=cname, clevel=level, shuffle=shuffle_mode)]
         elif algorithm == "zstd":
-            return Zstd(level=level)
+            return [Zstd(level=level)]
         elif algorithm == "none" or algorithm is None:
             return None
         else:
             # Default to blosc with lz4
-            return Blosc(cname="lz4", clevel=level, shuffle=1 if shuffle else 0)
+            return [Blosc(cname="lz4", clevel=level, shuffle=1 if shuffle else 0)]
     
     def _check_memory_usage(self) -> float:
         """
@@ -495,7 +494,7 @@ class ZarrStorageManager(StorageInterface):
                 shape=full_shape,
                 chunks=chunks,
                 dtype=tensor_data.dtype,
-                compressor=self.get_compressor(tensor_type),
+                compressors=self.get_compressor(tensor_type),
             )
             
             # Store metadata
@@ -529,7 +528,7 @@ class ZarrStorageManager(StorageInterface):
                     shape=(1,) + tensor_data.shape,
                     chunks=self.determine_chunks((1,) + tensor_data.shape, tensor_type),
                     dtype=tensor_data.dtype,
-                    compressor=self.get_compressor(tensor_type),
+                    compressors=self.get_compressor(tensor_type),
                 )
                 new_array[0] = tensor_data
                 print(f"Successfully stored data using alternate array {new_name}")
@@ -616,7 +615,7 @@ class ZarrStorageManager(StorageInterface):
                 shape=(0,),
                 chunks=(min(100, max(1, self.config["chunking"]["time_dimension"])),),
                 dtype=np.float32,
-                compressor=self.get_compressor(),
+                compressors=self.get_compressor(),
             )
         else:
             metric_array = self.metrics_group[metric_name]
@@ -684,7 +683,7 @@ class ZarrStorageManager(StorageInterface):
                 data=weight_data, # Directly pass data for creation
                 chunks=True, # Let Zarr decide chunking for individual optimizer weights
                 dtype=weight_data.dtype,
-                compressor=self.get_compressor("optimizer_state"), # Specify a compressor category
+                compressors=self.get_compressor("optimizer_state"), # Specify a compressor category
                 overwrite=True # Ensure we can update if called multiple times for same step (though unlikely here)
             )
             weight_array.attrs["dtype"] = str(weight_data.dtype)
@@ -798,7 +797,7 @@ class ZarrStorageManager(StorageInterface):
                 f"weight_{i}",
                 data=weight_data,
                 chunks=True,
-                compressor=self.get_compressor()
+                compressors=self.get_compressor()
             )
             
             # Store metadata
@@ -834,7 +833,7 @@ class ZarrStorageManager(StorageInterface):
                     f"weight_{i}",
                     data=opt_weight,
                     chunks=True,
-                    compressor=self.get_compressor()
+                    compressors=self.get_compressor()
                 )
         
         # Store compile config if available

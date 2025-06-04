@@ -220,14 +220,12 @@ class IcechunkModelAnalyzer:
         # CRITICAL FIX: Explicitly check for has_gradients attribute
         if "has_gradients" in layer_group.attrs and layer_group.attrs["has_gradients"]:
             if "gradients" not in tensor_types:
-                print(f"Layer {layer_name} has has_gradients=True but no gradients group found")
                 # Try to see if there's a hidden gradients group
                 try:
                     if hasattr(layer_group, 'gradients') or (hasattr(layer_group, '__contains__') and 'gradients' in layer_group):
-                        print(f"Found hidden gradients group for layer {layer_name}")
                         tensor_types.append("gradients")
-                except Exception as e:
-                    print(f"Error checking for hidden gradients group: {e}")
+                except Exception:
+                    pass
         
         info["tensor_types"] = tensor_types
         info["tensors"] = {}
@@ -238,9 +236,22 @@ class IcechunkModelAnalyzer:
                 tensor_names = list(tensor_group.keys())
                 info["tensors"][tensor_type] = tensor_names
                 
-                # Print for debugging if this is a gradients group
-                if tensor_type == "gradients":
-                    print(f"Found gradient tensors for layer {layer_name}: {tensor_names}")
+                # Check for actual tensor data to verify existence
+                if tensor_type == "gradients" and tensor_names:
+                    # Verify at least one gradient tensor actually has data
+                    has_valid_gradients = False
+                    for tensor_name in tensor_names:
+                        try:
+                            tensor_array = tensor_group[tensor_name]
+                            if tensor_array.shape[0] > 0:  # Has at least one time step
+                                has_valid_gradients = True
+                                break
+                        except Exception:
+                            continue
+                    
+                    if not has_valid_gradients:
+                        info["tensors"][tensor_type] = []  # Mark as empty if no valid data
+                
             except Exception as e:
                 print(f"Error getting tensor names for {layer_name}/{tensor_type}: {e}")
                 info["tensors"][tensor_type] = []
@@ -857,6 +868,8 @@ class IcechunkModelAnalyzer:
         """
         # Get layer names to analyze
         if layer_name is not None:
+            if self.layers_group is None:
+                raise ValueError("No layers group found")
             if layer_name not in self.layers_group:
                 raise ValueError(f"Layer {layer_name} not found")
             layers = [layer_name]
@@ -867,84 +880,125 @@ class IcechunkModelAnalyzer:
         total_layers = len(layers)
         total_layers_with_gradients = 0
         total_gradient_tensors = 0
+        errors_encountered = []
+        
+        print(f"Analyzing gradients for {total_layers} layers...")
         
         # Analyze each layer
         for name in layers:
-            layer_info = self.get_layer_info(name)
-            
-            # Check if layer has gradients
-            if "gradients" not in layer_info.get("tensor_types", []):
-                continue
+            try:
+                layer_info = self.get_layer_info(name)
                 
-            total_layers_with_gradients += 1
-            layer_stats = {}
-            
-            # Get all gradient tensors for this layer
-            tensors = layer_info.get("tensors", {}).get("gradients", [])
-            
-            if not tensors:
-                print(f"Layer {name} has 'gradients' tensor type but no gradient tensors were found.")
-                continue
-            
-            layer_gradient_count = 0
-            
-            for tensor_name in tensors:
-                try:
-                    # Get gradient data
-                    grad_data = self.get_tensor_data(name, "gradients", tensor_name)
+                # Check if layer has gradients
+                if "gradients" not in layer_info.get("tensor_types", []):
+                    continue
                     
-                    # Check if we actually got data
-                    if grad_data.size == 0:
-                        print(f"Warning: Empty gradient data for {name}/{tensor_name}")
-                        continue
+                total_layers_with_gradients += 1
+                layer_stats = {}
+                
+                # Get all gradient tensors for this layer
+                tensors = layer_info.get("tensors", {}).get("gradients", [])
+                
+                if not tensors:
+                    continue
+                
+                layer_gradient_count = 0
+                
+                for tensor_name in tensors:
+                    try:
+                        # Get gradient data
+                        grad_data = self.get_tensor_data(name, "gradients", tensor_name)
+                        
+                        # Check if we actually got data
+                        if grad_data is None or grad_data.size == 0:
+                            print(f"Warning: Empty gradient data for {name}/{tensor_name}")
+                            continue
+                        
+                        layer_gradient_count += 1
+                        total_gradient_tensors += 1
+                        
+                        # Calculate statistics with error handling
+                        try:
+                            tensor_stats = {
+                                "shape": grad_data.shape,
+                                "dtype": str(grad_data.dtype),
+                            }
+                            
+                            # Basic statistics
+                            if grad_data.size > 0:
+                                tensor_stats.update({
+                                    "mean_abs": float(np.mean(np.abs(grad_data))),
+                                    "mean": float(np.mean(grad_data)),
+                                    "std": float(np.std(grad_data)),
+                                    "min": float(np.min(grad_data)),
+                                    "max": float(np.max(grad_data)),
+                                    "zero_fraction": float(np.mean(grad_data == 0.0)),
+                                })
+                                
+                                # Add norm across time if we have time dimension
+                                if len(grad_data.shape) > 1:
+                                    try:
+                                        norms = np.linalg.norm(grad_data.reshape(grad_data.shape[0], -1), axis=1)
+                                        tensor_stats.update({
+                                            "norm_mean": float(np.mean(norms)),
+                                            "norm_std": float(np.std(norms)),
+                                            "norm_min": float(np.min(norms)),
+                                            "norm_max": float(np.max(norms)),
+                                        })
+                                    except Exception as norm_error:
+                                        tensor_stats["norm_error"] = str(norm_error)
+                                else:
+                                    # For 1D data, norm is just absolute value
+                                    tensor_stats.update({
+                                        "norm_mean": tensor_stats["mean_abs"],
+                                        "norm_std": 0.0,
+                                        "norm_min": tensor_stats["mean_abs"],
+                                        "norm_max": tensor_stats["mean_abs"],
+                                    })
+                            
+                            layer_stats[tensor_name] = tensor_stats
+                            
+                        except Exception as stat_error:
+                            error_msg = f"Error computing statistics for {name}/{tensor_name}: {stat_error}"
+                            errors_encountered.append(error_msg)
+                            print(f"Warning: {error_msg}")
+                            
+                    except Exception as data_error:
+                        error_msg = f"Error analyzing gradients for {name}/{tensor_name}: {data_error}"
+                        errors_encountered.append(error_msg)
+                        print(f"Warning: {error_msg}")
+                
+                if layer_gradient_count > 0:
+                    stats[name] = layer_stats
+                    print(f"Found {layer_gradient_count} gradient tensors for layer {name}")
                     
-                    layer_gradient_count += 1
-                    total_gradient_tensors += 1
-                    
-                    # Calculate statistics
-                    tensor_stats = {
-                        "mean_abs": np.mean(np.abs(grad_data), axis=0).mean(),
-                        "mean": np.mean(grad_data),
-                        "std": np.std(grad_data),
-                        "min": np.min(grad_data),
-                        "max": np.max(grad_data),
-                        "zero_fraction": np.mean(grad_data == 0.0),
-                        "shape": grad_data.shape,
-                    }
-                    
-                    # Add norm across time
-                    norms = np.linalg.norm(grad_data.reshape(grad_data.shape[0], -1), axis=1)
-                    tensor_stats["norm_mean"] = np.mean(norms)
-                    tensor_stats["norm_std"] = np.std(norms)
-                    tensor_stats["norm_min"] = np.min(norms)
-                    tensor_stats["norm_max"] = np.max(norms)
-                    
-                    layer_stats[tensor_name] = tensor_stats
-                except Exception as e:
-                    print(f"Error analyzing gradients for {name}/{tensor_name}: {e}")
-            
-            if layer_gradient_count > 0:
-                stats[name] = layer_stats
-                print(f"Found {layer_gradient_count} gradient tensors for layer {name}")
-            else:
-                print(f"No valid gradient tensors found for layer {name}")
+            except Exception as layer_error:
+                error_msg = f"Error analyzing layer {name}: {layer_error}"
+                errors_encountered.append(error_msg)
+                print(f"Warning: {error_msg}")
         
         # Add summary information
         summary = {
             "total_layers": total_layers,
             "layers_with_gradients": total_layers_with_gradients,
             "total_gradient_tensors": total_gradient_tensors,
-            "gradient_coverage": total_layers_with_gradients / total_layers if total_layers else 0
+            "gradient_coverage": total_layers_with_gradients / total_layers if total_layers else 0,
+            "errors_encountered": len(errors_encountered),
         }
         
         if total_gradient_tensors == 0:
             print("WARNING: No gradient tensors were found in the dataset!")
+            if errors_encountered:
+                print("Errors encountered during analysis:")
+                for error in errors_encountered[:5]:  # Show first 5 errors
+                    print(f"  - {error}")
         else:
             print(f"Found a total of {total_gradient_tensors} gradient tensors across {total_layers_with_gradients} layers")
         
         return {
             "summary": summary,
-            "layer_stats": stats
+            "layer_stats": stats,
+            "errors": errors_encountered if errors_encountered else None
         }
 
     def get_optimizer_state(self, step: int) -> List[np.ndarray]:
@@ -1210,3 +1264,639 @@ class IcechunkModelAnalyzer:
                 print(f"Error computing metrics for step {step}: {e}")
         
         return results 
+
+    # Enhanced Git-like functionality
+    
+    def diff_snapshots_visual(
+        self,
+        reference1: str,
+        reference2: str,
+        output_format: str = "console",
+        include_values: bool = False
+    ) -> Union[str, Dict[str, Any]]:
+        """
+        Create a visual diff between two snapshots.
+        
+        Args:
+            reference1: First reference (snapshot ID, branch, or tag)
+            reference2: Second reference (snapshot ID, branch, or tag)
+            output_format: Output format - 'console', 'html', or 'dict'
+            include_values: Whether to include actual tensor values in diff
+            
+        Returns:
+            Formatted diff output
+        """
+        # Resolve references
+        snapshot1_id = reference1 if len(reference1) > 10 else None
+        snapshot2_id = reference2 if len(reference2) > 10 else None
+        
+        if not snapshot1_id or not snapshot2_id:
+            # Try to resolve through repo
+            try:
+                if hasattr(self, 'repo'):
+                    if not snapshot1_id:
+                        snapshot1_id = self._resolve_reference(reference1)
+                    if not snapshot2_id:
+                        snapshot2_id = self._resolve_reference(reference2)
+            except:
+                pass
+                
+        if not snapshot1_id or not snapshot2_id:
+            raise ValueError("Could not resolve snapshot references")
+        
+        # Create analyzers for both snapshots
+        analyzer1 = IcechunkModelAnalyzer(self.repo, snapshot_id=snapshot1_id)
+        analyzer2 = IcechunkModelAnalyzer(self.repo, snapshot_id=snapshot2_id)
+        
+        diff_data = {
+            "snapshot1": snapshot1_id[:8],
+            "snapshot2": snapshot2_id[:8],
+            "metadata": self._diff_metadata(analyzer1, analyzer2),
+            "layers": self._diff_layers_detailed(analyzer1, analyzer2, include_values),
+            "metrics": self._diff_metrics(analyzer1, analyzer2),
+            "summary": {
+                "total_changes": 0,
+                "layers_added": [],
+                "layers_removed": [],
+                "layers_modified": []
+            }
+        }
+        
+        # Calculate summary
+        for layer_name, layer_diff in diff_data["layers"].items():
+            if layer_diff.get("status") == "added":
+                diff_data["summary"]["layers_added"].append(layer_name)
+            elif layer_diff.get("status") == "removed":
+                diff_data["summary"]["layers_removed"].append(layer_name)
+            elif layer_diff.get("has_changes", False):
+                diff_data["summary"]["layers_modified"].append(layer_name)
+                
+        diff_data["summary"]["total_changes"] = (
+            len(diff_data["summary"]["layers_added"]) +
+            len(diff_data["summary"]["layers_removed"]) +
+            len(diff_data["summary"]["layers_modified"]) +
+            len(diff_data["metadata"])
+        )
+        
+        # Format output
+        if output_format == "dict":
+            return diff_data
+        elif output_format == "console":
+            return self._format_diff_console(diff_data)
+        elif output_format == "html":
+            return self._format_diff_html(diff_data)
+        else:
+            raise ValueError(f"Unknown output format: {output_format}")
+    
+    def _resolve_reference(self, reference: str) -> str:
+        """Resolve a reference to a snapshot ID."""
+        try:
+            # Try as branch
+            return self.repo.lookup_branch(reference)
+        except:
+            pass
+        try:
+            # Try as tag
+            return self.repo.lookup_tag(reference)
+        except:
+            pass
+        # Assume it's a snapshot ID
+        return reference
+    
+    def _diff_metadata(self, analyzer1, analyzer2) -> Dict[str, Any]:
+        """Compare metadata between two analyzers."""
+        meta1 = analyzer1.get_run_metadata()
+        meta2 = analyzer2.get_run_metadata()
+        
+        diff = {}
+        all_keys = set(meta1.keys()) | set(meta2.keys())
+        
+        for key in all_keys:
+            val1 = meta1.get(key)
+            val2 = meta2.get(key)
+            if val1 != val2:
+                diff[key] = {"old": val1, "new": val2}
+                
+        return diff
+    
+    def _diff_layers_detailed(self, analyzer1, analyzer2, include_values: bool) -> Dict[str, Any]:
+        """Compare layers between two analyzers with detailed information."""
+        layers1 = set(analyzer1.get_layer_names())
+        layers2 = set(analyzer2.get_layer_names())
+        
+        diff = {}
+        
+        # Check removed layers
+        for layer in layers1 - layers2:
+            diff[layer] = {"status": "removed"}
+            
+        # Check added layers
+        for layer in layers2 - layers1:
+            diff[layer] = {"status": "added"}
+            
+        # Check modified layers
+        for layer in layers1 & layers2:
+            layer_diff = self._compare_layer_detailed(
+                analyzer1, analyzer2, layer, include_values
+            )
+            if layer_diff["has_changes"]:
+                diff[layer] = layer_diff
+                
+        return diff
+    
+    def _compare_layer_detailed(self, analyzer1, analyzer2, layer_name: str, include_values: bool) -> Dict[str, Any]:
+        """Compare a specific layer between two analyzers."""
+        info1 = analyzer1.get_layer_info(layer_name)
+        info2 = analyzer2.get_layer_info(layer_name)
+        
+        layer_diff = {
+            "has_changes": False,
+            "attribute_changes": {},
+            "tensor_changes": {}
+        }
+        
+        # Compare attributes
+        attrs1 = {k: v for k, v in info1.items() if k not in ['tensor_types', 'tensors']}
+        attrs2 = {k: v for k, v in info2.items() if k not in ['tensor_types', 'tensors']}
+        
+        for key in set(attrs1.keys()) | set(attrs2.keys()):
+            if attrs1.get(key) != attrs2.get(key):
+                layer_diff["attribute_changes"][key] = {
+                    "old": attrs1.get(key),
+                    "new": attrs2.get(key)
+                }
+                layer_diff["has_changes"] = True
+        
+        # Compare tensors
+        tensors1 = info1.get('tensors', {})
+        tensors2 = info2.get('tensors', {})
+        
+        for tensor_type in set(tensors1.keys()) | set(tensors2.keys()):
+            type_diff = {}
+            
+            t1_names = set(tensors1.get(tensor_type, []))
+            t2_names = set(tensors2.get(tensor_type, []))
+            
+            # Removed tensors
+            for name in t1_names - t2_names:
+                type_diff[name] = {"status": "removed"}
+                
+            # Added tensors
+            for name in t2_names - t1_names:
+                type_diff[name] = {"status": "added"}
+                
+            # Modified tensors
+            for name in t1_names & t2_names:
+                if include_values:
+                    try:
+                        # Compare actual values
+                        data1 = analyzer1.get_tensor_data(layer_name, tensor_type, name)
+                        data2 = analyzer2.get_tensor_data(layer_name, tensor_type, name)
+                        
+                        if data1.shape != data2.shape:
+                            type_diff[name] = {
+                                "shape_changed": True,
+                                "old_shape": data1.shape,
+                                "new_shape": data2.shape
+                            }
+                        elif not np.array_equal(data1[-1], data2[-1]):
+                            # Just compare last timestep
+                            type_diff[name] = {
+                                "values_changed": True,
+                                "norm_diff": float(np.linalg.norm(data2[-1] - data1[-1]))
+                            }
+                    except:
+                        type_diff[name] = {"error": "Could not compare values"}
+                        
+            if type_diff:
+                layer_diff["tensor_changes"][tensor_type] = type_diff
+                layer_diff["has_changes"] = True
+                
+        return layer_diff
+    
+    def _diff_metrics(self, analyzer1, analyzer2) -> Dict[str, Any]:
+        """Compare metrics between two analyzers."""
+        try:
+            metrics1 = analyzer1.get_metrics()
+            metrics2 = analyzer2.get_metrics()
+            
+            diff = {}
+            all_metrics = set(metrics1.keys()) | set(metrics2.keys())
+            
+            for metric in all_metrics:
+                if metric not in metrics1:
+                    diff[metric] = {"status": "added"}
+                elif metric not in metrics2:
+                    diff[metric] = {"status": "removed"}
+                else:
+                    # Compare values
+                    v1 = metrics1[metric]
+                    v2 = metrics2[metric]
+                    if len(v1) != len(v2) or not np.array_equal(v1, v2):
+                        diff[metric] = {
+                            "old_length": len(v1),
+                            "new_length": len(v2),
+                            "last_value_old": float(v1[-1]) if len(v1) > 0 else None,
+                            "last_value_new": float(v2[-1]) if len(v2) > 0 else None
+                        }
+                        
+            return diff
+        except:
+            return {}
+    
+    def _format_diff_console(self, diff_data: Dict[str, Any]) -> str:
+        """Format diff data for console output."""
+        lines = []
+        
+        # Header
+        lines.append(f"\nDiff between {diff_data['snapshot1']} and {diff_data['snapshot2']}")
+        lines.append("=" * 60)
+        
+        # Summary
+        summary = diff_data['summary']
+        lines.append(f"\nSummary: {summary['total_changes']} total changes")
+        if summary['layers_added']:
+            lines.append(f"  Added layers: {', '.join(summary['layers_added'])}")
+        if summary['layers_removed']:
+            lines.append(f"  Removed layers: {', '.join(summary['layers_removed'])}")
+        if summary['layers_modified']:
+            lines.append(f"  Modified layers: {', '.join(summary['layers_modified'])}")
+        
+        # Metadata changes
+        if diff_data['metadata']:
+            lines.append("\nMetadata Changes:")
+            for key, change in diff_data['metadata'].items():
+                lines.append(f"  {key}: {change['old']} → {change['new']}")
+        
+        # Layer changes
+        if diff_data['layers']:
+            lines.append("\nLayer Changes:")
+            for layer_name, layer_diff in diff_data['layers'].items():
+                if layer_diff.get('status') == 'added':
+                    lines.append(f"  + {layer_name} (added)")
+                elif layer_diff.get('status') == 'removed':
+                    lines.append(f"  - {layer_name} (removed)")
+                else:
+                    lines.append(f"  ~ {layer_name} (modified)")
+                    
+                    # Show attribute changes
+                    if layer_diff.get('attribute_changes'):
+                        for attr, change in layer_diff['attribute_changes'].items():
+                            lines.append(f"    {attr}: {change['old']} → {change['new']}")
+                    
+                    # Show tensor changes
+                    if layer_diff.get('tensor_changes'):
+                        for tensor_type, tensors in layer_diff['tensor_changes'].items():
+                            lines.append(f"    {tensor_type}:")
+                            for tensor_name, change in tensors.items():
+                                if change.get('status') == 'added':
+                                    lines.append(f"      + {tensor_name}")
+                                elif change.get('status') == 'removed':
+                                    lines.append(f"      - {tensor_name}")
+                                elif change.get('shape_changed'):
+                                    lines.append(f"      ~ {tensor_name}: shape {change['old_shape']} → {change['new_shape']}")
+                                elif change.get('values_changed'):
+                                    lines.append(f"      ~ {tensor_name}: values changed (norm diff: {change.get('norm_diff', 'N/A'):.6f})")
+        
+        return "\n".join(lines)
+    
+    def _format_diff_html(self, diff_data: Dict[str, Any]) -> str:
+        """Format diff data as HTML."""
+        html = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: monospace; }}
+                .added {{ color: green; }}
+                .removed {{ color: red; }}
+                .modified {{ color: orange; }}
+                .diff-section {{ margin: 20px 0; }}
+                .indent1 {{ margin-left: 20px; }}
+                .indent2 {{ margin-left: 40px; }}
+            </style>
+        </head>
+        <body>
+            <h2>Diff between {diff_data['snapshot1']} and {diff_data['snapshot2']}</h2>
+            
+            <div class="diff-section">
+                <h3>Summary</h3>
+                <p>Total changes: {diff_data['summary']['total_changes']}</p>
+                <ul>
+                    <li class="added">Added layers: {len(diff_data['summary']['layers_added'])}</li>
+                    <li class="removed">Removed layers: {len(diff_data['summary']['layers_removed'])}</li>
+                    <li class="modified">Modified layers: {len(diff_data['summary']['layers_modified'])}</li>
+                </ul>
+            </div>
+        """
+        
+        # Add more HTML formatting as needed
+        
+        html += "</body></html>"
+        return html
+    
+    def checkout_analyzer(self, reference: str) -> 'IcechunkModelAnalyzer':
+        """
+        Create a new analyzer instance for a different snapshot.
+        
+        Args:
+            reference: Snapshot ID, branch, or tag
+            
+        Returns:
+            New IcechunkModelAnalyzer instance
+        """
+        snapshot_id = self._resolve_reference(reference)
+        return IcechunkModelAnalyzer(
+            self.repo,
+            snapshot_id=snapshot_id,
+            lazy_loading=self.lazy_loading
+        )
+
+    def analyze_branch_evolution(self, branch_name: str, limit: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Analyze the evolution of a model across commits on a branch.
+        
+        Args:
+            branch_name: Name of the branch to analyze
+            limit: Maximum number of commits to analyze
+            
+        Returns:
+            Analysis of model evolution across the branch
+        """
+        if not self.repo:
+            raise ConnectionError("Repository not open.")
+        
+        try:
+            # Get branch history
+            branch_snapshot = self.repo.lookup_branch(branch_name)
+            history = self.repo.ancestry(snapshot_id=branch_snapshot)
+            
+            evolution = {
+                "branch": branch_name,
+                "total_commits": 0,
+                "commits_analyzed": 0,
+                "parameter_evolution": {},
+                "architecture_changes": [],
+                "training_progression": {}
+            }
+            
+            prev_analyzer = None
+            commit_count = 0
+            
+            for snapshot_info in history:
+                if limit and commit_count >= limit:
+                    break
+                
+                evolution["total_commits"] += 1
+                
+                try:
+                    # Create analyzer for this snapshot
+                    current_analyzer = IcechunkModelAnalyzer(
+                        self.repo, snapshot_id=snapshot_info.id, lazy_loading=True
+                    )
+                    
+                    # Get basic metadata
+                    metadata = current_analyzer.get_run_metadata()
+                    
+                    commit_info = {
+                        "snapshot_id": snapshot_info.id,
+                        "message": snapshot_info.message,
+                        "timestamp": snapshot_info.written_at.isoformat() if snapshot_info.written_at else None,
+                        "step": metadata.get("current_step", commit_count),
+                    }
+                    
+                    # Compare with previous commit if available
+                    if prev_analyzer:
+                        try:
+                            # Simple parameter count comparison
+                            curr_layers = current_analyzer.get_layer_names()
+                            prev_layers = prev_analyzer.get_layer_names()
+                            
+                            if set(curr_layers) != set(prev_layers):
+                                evolution["architecture_changes"].append({
+                                    "commit": snapshot_info.id,
+                                    "layers_added": list(set(curr_layers) - set(prev_layers)),
+                                    "layers_removed": list(set(prev_layers) - set(curr_layers))
+                                })
+                            
+                        except Exception as e:
+                            print(f"Error comparing snapshots: {e}")
+                    
+                    evolution["commits_analyzed"] += 1
+                    prev_analyzer = current_analyzer
+                    commit_count += 1
+                    
+                except Exception as e:
+                    print(f"Error analyzing snapshot {snapshot_info.id}: {e}")
+            
+            return evolution
+            
+        except Exception as e:
+            print(f"Error analyzing branch evolution: {e}")
+            return {"error": str(e)}
+
+    def compare_branches(self, branch1: str, branch2: str) -> Dict[str, Any]:
+        """
+        Compare the latest state of two branches.
+        
+        Args:
+            branch1: First branch name
+            branch2: Second branch name
+            
+        Returns:
+            Comparison results between the branches
+        """
+        if not self.repo:
+            raise ConnectionError("Repository not open.")
+        
+        try:
+            # Get latest snapshots for both branches
+            snap1 = self.repo.lookup_branch(branch1)
+            snap2 = self.repo.lookup_branch(branch2)
+            
+            # Create analyzers for both branches
+            analyzer1 = IcechunkModelAnalyzer(self.repo, snapshot_id=snap1, lazy_loading=True)
+            analyzer2 = IcechunkModelAnalyzer(self.repo, snapshot_id=snap2, lazy_loading=True)
+            
+            comparison = {
+                "branch1": {"name": branch1, "snapshot": snap1},
+                "branch2": {"name": branch2, "snapshot": snap2},
+                "metadata_diff": self._diff_metadata(analyzer1, analyzer2),
+                "layer_diff": self._diff_layers_detailed(analyzer1, analyzer2, include_values=False),
+                "training_diff": {},
+                "summary": {
+                    "branches_diverged": snap1 != snap2,
+                    "architecture_identical": True,
+                    "training_differences": []
+                }
+            }
+            
+            # Check if architectures are identical
+            layers1 = set(analyzer1.get_layer_names())
+            layers2 = set(analyzer2.get_layer_names())
+            comparison["summary"]["architecture_identical"] = layers1 == layers2
+            
+            # Compare training progression
+            try:
+                meta1 = analyzer1.get_run_metadata()
+                meta2 = analyzer2.get_run_metadata()
+                
+                step1 = meta1.get("current_step", 0)
+                step2 = meta2.get("current_step", 0)
+                
+                comparison["training_diff"] = {
+                    "step_difference": step2 - step1,
+                    "branch1_step": step1,
+                    "branch2_step": step2
+                }
+                
+                if step1 != step2:
+                    comparison["summary"]["training_differences"].append("Different training progress")
+                    
+            except Exception as e:
+                comparison["training_diff"]["error"] = str(e)
+            
+            return comparison
+            
+        except Exception as e:
+            return {"error": f"Error comparing branches: {e}"}
+
+    def get_commit_info(self, reference: str) -> Dict[str, Any]:
+        """
+        Get detailed information about a specific commit.
+        
+        Args:
+            reference: Snapshot ID, branch, or tag
+            
+        Returns:
+            Detailed commit information
+        """
+        snapshot_id = self._resolve_reference(reference)
+        if not snapshot_id:
+            raise ValueError(f"Reference '{reference}' not found")
+        
+        try:
+            # Get snapshot info
+            snapshot = self.repo.get_snapshot(snapshot_id)
+            
+            # Create analyzer for this snapshot
+            analyzer = IcechunkModelAnalyzer(self.repo, snapshot_id=snapshot_id, lazy_loading=True)
+            
+            commit_info = {
+                "snapshot_id": snapshot_id,
+                "message": snapshot.message,
+                "timestamp": snapshot.written_at.isoformat() if snapshot.written_at else None,
+                "metadata": analyzer.get_run_metadata(),
+                "layers": analyzer.get_layer_names(),
+                "layer_count": len(analyzer.get_layer_names()),
+                "has_gradients": False,
+                "gradient_layers": []
+            }
+            
+            # Check for gradient data
+            for layer_name in analyzer.get_layer_names():
+                try:
+                    layer_info = analyzer.get_layer_info(layer_name)
+                    if "gradients" in layer_info.get("tensor_types", []):
+                        commit_info["has_gradients"] = True
+                        commit_info["gradient_layers"].append(layer_name)
+                except:
+                    pass
+            
+            # Get tags pointing to this snapshot
+            try:
+                all_tags = self.repo.list_tags()
+                commit_tags = [tag for tag, tag_snap in all_tags.items() if tag_snap == snapshot_id]
+                commit_info["tags"] = commit_tags
+            except:
+                commit_info["tags"] = []
+            
+            return commit_info
+            
+        except Exception as e:
+            return {"error": f"Error getting commit info: {e}"}
+
+    def analyze_training_trends(self, reference: Optional[str] = None, lookback_commits: int = 10) -> Dict[str, Any]:
+        """
+        Analyze training trends across recent commits.
+        
+        Args:
+            reference: Reference to start analysis from (defaults to current)
+            lookback_commits: Number of commits to analyze
+            
+        Returns:
+            Training trend analysis
+        """
+        if not self.repo:
+            raise ConnectionError("Repository not open.")
+        
+        start_snapshot = reference or self.snapshot_id
+        if reference:
+            start_snapshot = self._resolve_reference(reference)
+        
+        try:
+            # Get commit history
+            history = list(self.repo.ancestry(snapshot_id=start_snapshot))[:lookback_commits]
+            
+            trends = {
+                "commits_analyzed": len(history),
+                "step_progression": [],
+                "parameter_trends": {},
+                "architecture_stability": True,
+                "gradient_availability": []
+            }
+            
+            baseline_layers = None
+            
+            for i, snapshot_info in enumerate(history):
+                try:
+                    analyzer = IcechunkModelAnalyzer(
+                        self.repo, snapshot_id=snapshot_info.id, lazy_loading=True
+                    )
+                    
+                    metadata = analyzer.get_run_metadata()
+                    step = metadata.get("current_step", i)
+                    layers = analyzer.get_layer_names()
+                    
+                    trends["step_progression"].append({
+                        "snapshot_id": snapshot_info.id,
+                        "step": step,
+                        "layer_count": len(layers),
+                        "message": snapshot_info.message
+                    })
+                    
+                    # Check architecture stability
+                    if baseline_layers is None:
+                        baseline_layers = set(layers)
+                    elif set(layers) != baseline_layers:
+                        trends["architecture_stability"] = False
+                    
+                    # Check gradient availability
+                    has_gradients = False
+                    for layer_name in layers[:3]:  # Check first few layers
+                        try:
+                            layer_info = analyzer.get_layer_info(layer_name)
+                            if "gradients" in layer_info.get("tensor_types", []):
+                                has_gradients = True
+                                break
+                        except:
+                            pass
+                    
+                    trends["gradient_availability"].append(has_gradients)
+                    
+                except Exception as e:
+                    print(f"Error analyzing snapshot {snapshot_info.id}: {e}")
+            
+            # Calculate trend statistics
+            if len(trends["step_progression"]) > 1:
+                steps = [entry["step"] for entry in trends["step_progression"]]
+                trends["step_trend"] = {
+                    "increasing": all(steps[i] <= steps[i+1] for i in range(len(steps)-1)),
+                    "total_progress": steps[-1] - steps[0] if steps else 0
+                }
+            
+            trends["gradient_consistency"] = all(trends["gradient_availability"]) if trends["gradient_availability"] else False
+            
+            return trends
+            
+        except Exception as e:
+            return {"error": f"Error analyzing training trends: {e}"} 

@@ -103,7 +103,7 @@ results/
 metrics/
 params/
 models/
-
+examples/
 # Plot output files
 *.png
 *.jpg

@@ -111,15 +111,24 @@ class GradientCollector:
             for weight in layer.trainable_weights:
                 var_name = weight.name
                 
-                # Extract tensor name
+                # Extract tensor name (kernel, bias, etc.)
                 tensor_name = var_name
                 if ":" in tensor_name:
                     tensor_name = tensor_name.split(":")[0]
                 if "/" in tensor_name:
                     tensor_name = tensor_name.split("/")[-1]
                 
-                # Store mapping
-                self._var_to_layer_map[var_name] = (layer.name, tensor_name)
+                # Use the actual layer name from the layer object
+                # This ensures we get "conv2d", "conv2d_1", "dense", "dense_1", etc.
+                actual_layer_name = layer.name
+                
+                # Store mapping with the actual layer name
+                self._var_to_layer_map[var_name] = (actual_layer_name, tensor_name)
+                
+                # Also store mapping without the ":0" suffix for compatibility
+                if ":" in var_name:
+                    clean_var_name = var_name.split(":")[0]
+                    self._var_to_layer_map[clean_var_name] = (actual_layer_name, tensor_name)
     
     def capture_gradients(
         self,
@@ -164,17 +173,58 @@ class GradientCollector:
             if ":" in var_name:
                 var_name = var_name.split(":")[0]
             
+            # DEBUG: Print variable information
+            if self.storage.config.get("verbose", False):
+                print(f"Debug: Processing variable '{var.name}' -> cleaned: '{var_name}'")
+            
             # Extract full layer name and tensor name
             parts = var_name.split("/")
             
-            # Initialize layer_name to a default value to avoid the reference error
+            # IMPROVED: Extract actual TensorFlow layer names properly
             layer_name = "unknown_layer"
             tensor_name = "unknown_tensor"
             
-            if len(parts) > 1:
-                # Try to extract proper layer name - fixing the bug
-                layer_name = parts[0]  # Use only the base layer name
-                tensor_name = parts[-1]
+            if len(parts) >= 2:
+                # For TensorFlow variables like "conv2d/kernel" or "dense_1/bias"
+                # The layer name is everything except the last part, but prefer the actual TF layer name
+                
+                # Check if we have this variable in our mapping (from build_variable_mapping)
+                full_var_name = var.name
+                if full_var_name in self._var_to_layer_map:
+                    layer_name, tensor_name = self._var_to_layer_map[full_var_name]
+                    if self.storage.config.get("verbose", False):
+                        print(f"Debug: Found in mapping: {full_var_name} -> {layer_name}/{tensor_name}")
+                else:
+                    # Fallback to parsing the variable name
+                    layer_name = "/".join(parts[:-1])
+                    tensor_name = parts[-1]
+                    
+                    # Try to get the actual layer name from the variable's layer reference
+                    # This helps distinguish between conv2d, conv2d_1, dense, dense_1, etc.
+                    try:
+                        if hasattr(var, '_keras_layer'):
+                            layer_name = var._keras_layer.name
+                        elif hasattr(var, 'layer'):
+                            layer_name = var.layer.name
+                        # If we can't get the layer name, use the first part which is usually correct
+                        elif len(parts) >= 1:
+                            layer_name = parts[0]  # e.g., "conv2d", "dense_1"
+                    except:
+                        pass
+                    
+                    if self.storage.config.get("verbose", False):
+                        print(f"Debug: Not in mapping, using fallback: {full_var_name} -> {layer_name}/{tensor_name}")
+                        
+            elif len(parts) == 1:
+                # Single part - use as both layer and tensor name
+                layer_name = parts[0]
+                tensor_name = parts[0]
+            
+            # Ensure we have valid names
+            if not layer_name:
+                layer_name = "unknown_layer"
+            if not tensor_name:
+                tensor_name = "unknown_tensor"
             
             # Create a unique key for each variable
             unique_key = var_name.replace("/", "_").replace(":", "_")
@@ -215,10 +265,13 @@ class GradientCollector:
                     print(f"Storing gradient for {layer_name}/{tensor_name} with shape: {grad_numpy.shape}")
                     
                     try:
-                        # Store gradient - use unique_key to avoid conflicts
+                        # Store gradient - use layer-specific tensor name to avoid conflicts
+                        # Create a unique tensor name that includes layer info to prevent conflicts
+                        unique_tensor_name = f"{layer_name}_{tensor_name}"
+                        
                         self.storage.store_tensor(
                             layer_group,
-                            tensor_name,  # Use standard tensor name (kernel, bias)
+                            unique_tensor_name,  # Use unique tensor name per layer
                             "gradients",  # Standard tensor type
                             grad_numpy,
                             step
@@ -229,7 +282,7 @@ class GradientCollector:
                             self.storage.metrics_collector.process_tensor(
                                 layer_name,
                                 "gradients",
-                                tensor_name,
+                                unique_tensor_name,
                                 grad_numpy,
                                 step
                             )
@@ -247,12 +300,12 @@ class GradientCollector:
                                 print(f"Attempting alternate storage for {tensor_name} with shape {grad_numpy.shape}")
                                 
                                 # Create a new unique tensor name to avoid conflicts
-                                new_tensor_name = f"{tensor_name}_{grad_numpy.shape}"
+                                alt_tensor_name = f"{layer_name}_{tensor_name}_{hash(var.name) % 10000}"
                                 
                                 # Try to store with new name
                                 self.storage.store_tensor(
                                     layer_group,
-                                    new_tensor_name,
+                                    alt_tensor_name,
                                     "gradients",
                                     grad_numpy,
                                     step
@@ -263,12 +316,12 @@ class GradientCollector:
                                     self.storage.metrics_collector.process_tensor(
                                         layer_name,
                                         "gradients",
-                                        new_tensor_name,
+                                        alt_tensor_name,
                                         grad_numpy,
                                         step
                                     )
                                 
-                                print(f"Successfully stored with alternate name: {new_tensor_name}")
+                                print(f"Successfully stored with alternate name: {alt_tensor_name}")
                                 # Mark that we stored at least one gradient
                                 gradients_stored = True
                         except Exception as e2:

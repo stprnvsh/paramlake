@@ -279,10 +279,12 @@ class ActivationCollector:
                             # Debug print to verify shape
                             print(f"Storing activation for {layer_name} with shape: {activation_numpy.shape}")
                             
-                            # Store in Zarr
+                            # Store in Zarr - use unique tensor name per layer to avoid conflicts
+                            unique_tensor_name = f"{layer_name}_activation"
+                            
                             self.storage.store_tensor(
                                 layer_group,
-                                "activation",
+                                unique_tensor_name,  # Use unique tensor name per layer
                                 "activations",
                                 activation_numpy,
                                 step
@@ -293,7 +295,7 @@ class ActivationCollector:
                                 self.storage.metrics_collector.process_tensor(
                                     layer_name,
                                     "activations",
-                                    "activation",
+                                    unique_tensor_name,
                                     activation_numpy,
                                     step
                                 )
@@ -354,10 +356,12 @@ class ActivationCollector:
                             # Debug print to verify shape
                             print(f"Storing activation for {layer_name} with shape: {activation_numpy.shape}")
                             
-                            # Store in Zarr
+                            # Store in Zarr - use unique tensor name per layer to avoid conflicts
+                            unique_tensor_name = f"{layer_name}_activation"
+                            
                             self.storage.store_tensor(
                                 layer_group,
-                                "activation",
+                                unique_tensor_name,  # Use unique tensor name per layer
                                 "activations",
                                 activation_numpy,
                                 step
@@ -368,7 +372,7 @@ class ActivationCollector:
                                 self.storage.metrics_collector.process_tensor(
                                     layer_name,
                                     "activations",
-                                    "activation",
+                                    unique_tensor_name,
                                     activation_numpy,
                                     step
                                 )
@@ -519,7 +523,9 @@ class ActivationCollector:
                             if layer_name not in layer_tensor_batches:
                                 layer_tensor_batches[layer_name] = []
                             
-                            layer_tensor_batches[layer_name].append(("activation", activation_numpy))
+                            # Use unique tensor name for each layer to avoid conflicts
+                            unique_tensor_name = f"{layer_name}_activation"
+                            layer_tensor_batches[layer_name].append((unique_tensor_name, activation_numpy))
                         except Exception as e:
                             print(f"Error processing activation for layer {layer_name}: {e}")
                 
@@ -547,10 +553,12 @@ class ActivationCollector:
                         
                         # Process metrics if metrics collector is registered
                         if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                            # Use the first tensor name from the batch (which should be unique for this layer)
+                            first_tensor_name = tensor_data_pairs[0][0] if tensor_data_pairs else f"{layer_name}_activation"
                             self.storage.metrics_collector.process_tensor(
                                 layer_name,
                                 "activations",
-                                "activation",
+                                first_tensor_name,
                                 tensor_data_pairs[0][1],
                                 step
                             )
@@ -604,7 +612,9 @@ class ActivationCollector:
                             if layer_name not in layer_tensor_batches:
                                 layer_tensor_batches[layer_name] = []
                             
-                            layer_tensor_batches[layer_name].append(("activation", activation_numpy))
+                            # Use unique tensor name for each layer to avoid conflicts
+                            unique_tensor_name = f"{layer_name}_activation"
+                            layer_tensor_batches[layer_name].append((unique_tensor_name, activation_numpy))
                         except Exception as e:
                             print(f"Error processing activation for layer {layer_name}: {e}")
                     
@@ -632,10 +642,12 @@ class ActivationCollector:
                             
                             # Process metrics if metrics collector is registered
                             if hasattr(self.storage, 'metrics_collector') and self.storage.metrics_collector is not None:
+                                # Use the first tensor name from the batch (which should be unique for this layer)
+                                first_tensor_name = tensor_data_pairs[0][0] if tensor_data_pairs else f"{layer_name}_activation"
                                 self.storage.metrics_collector.process_tensor(
                                     layer_name,
                                     "activations",
-                                    "activation",
+                                    first_tensor_name,
                                     tensor_data_pairs[0][1],
                                     step
                                 )

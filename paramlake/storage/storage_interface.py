@@ -215,6 +215,64 @@ class StorageInterface(ABC):
         """
         self.metrics_collector = metrics_collector 
 
+    def get_tracked_layers(self) -> List[str]:
+        """
+        Get list of tracked layers.
+        
+        Returns:
+            List of layer names that are being tracked
+        """
+        return []
+
+    def set_verbose(self, verbose: bool) -> None:
+        """
+        Set verbose mode for debugging.
+        
+        Args:
+            verbose: Whether to enable verbose output
+        """
+        if hasattr(self, 'config'):
+            if hasattr(self.config, '_config'):
+                self.config._config['verbose'] = verbose
+            elif hasattr(self.config, 'to_dict'):
+                config_dict = self.config.to_dict()
+                config_dict['verbose'] = verbose
+                # Update the config if possible
+        
+    def get_storage_info(self) -> Dict[str, Any]:
+        """
+        Get information about the storage backend.
+        
+        Returns:
+            Dictionary with storage information
+        """
+        return {
+            "type": self.__class__.__name__,
+            "has_metrics_collector": self.metrics_collector is not None,
+        }
+
+    def validate_tensor_compatibility(
+        self, 
+        layer_name: str, 
+        tensor_name: str, 
+        tensor_type: str, 
+        tensor_data: np.ndarray
+    ) -> bool:
+        """
+        Validate if a tensor is compatible with existing storage.
+        
+        Args:
+            layer_name: Name of the layer
+            tensor_name: Name of the tensor
+            tensor_type: Type of tensor
+            tensor_data: Tensor data to validate
+            
+        Returns:
+            True if compatible, False otherwise
+        """
+        # Default implementation - always compatible
+        return True
+
     # --- Git-like functionality methods (non-abstract) ---
     # These are primarily for IcechunkStorageManager and have default no-op implementations
 
@@ -287,4 +345,47 @@ class StorageInterface(ABC):
         commit_message: Optional[str] = None
     ) -> str:
         """Default: Imports a model from an external file into the repository."""
+        raise NotImplementedError("Git-like versioning is not available in this storage manager.")
+        
+    # Enhanced Git-like methods
+    
+    def switch_branch(self, branch_name: str, create_if_missing: bool = False) -> Dict[str, Any]:
+        """Default: Switch to a different branch for future operations."""
+        raise NotImplementedError("Git-like versioning is not available in this storage manager.")
+    
+    def checkout_snapshot(self, reference: str, new_branch: Optional[str] = None) -> Dict[str, Any]:
+        """Default: Checkout to a specific snapshot to continue training from that point."""
+        raise NotImplementedError("Git-like versioning is not available in this storage manager.")
+    
+    def push_to_remote(self, remote_config: Dict[str, Any], branch: str = "main") -> Dict[str, Any]:
+        """Default: Push local changes to a remote repository."""
+        raise NotImplementedError("Git-like versioning is not available in this storage manager.")
+    
+    def pull_from_remote(self, remote_config: Dict[str, Any], branch: str = "main") -> Dict[str, Any]:
+        """Default: Pull changes from a remote repository."""
+        raise NotImplementedError("Git-like versioning is not available in this storage manager.")
+        
+    def rebase_branch(
+        self,
+        branch_name: str,
+        onto_branch: str,
+        conflict_strategy: str = 'detect'
+    ) -> str:
+        """Default: Rebase a branch onto another branch."""
+        raise NotImplementedError("Git-like versioning is not available in this storage manager.")
+    
+    def reset_branch(self, branch_name: str, to_reference: str) -> None:
+        """Default: Reset a branch to a specific reference."""
+        raise NotImplementedError("Git-like versioning is not available in this storage manager.")
+    
+    def get_conflicts(self, branch1: str, branch2: str) -> List[Dict[str, Any]]:
+        """Default: Detect conflicts between two branches."""
+        return []
+    
+    def commit_with_rebase(
+        self,
+        message: str,
+        conflict_strategy: str = 'detect'
+    ) -> str:
+        """Default: Commit with automatic rebasing."""
         raise NotImplementedError("Git-like versioning is not available in this storage manager.") 

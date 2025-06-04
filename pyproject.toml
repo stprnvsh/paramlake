@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paramlake"
-version = "0.1.0"
+version = "0.1.1"
 description = "A comprehensive parameter tracking and storage system for TensorFlow models using Zarr"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -19,6 +19,7 @@ dependencies = [
     "numcodecs>=0.10.0",
     "pyyaml>=6.0",
     "numpy>=1.19.0",
+    "icechunk>=0.1.0",
 ]
 
 [project.urls]

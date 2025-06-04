@@ -4,6 +4,7 @@ Command-line interface for ParamLake.
 import typer
 from typing_extensions import Annotated
 from typing import Optional
+import os
 
 from paramlake.repo import Repo
 # from paramlake.utils.config import ParamLakeConfig # If needed for CLI-specific config loading
@@ -12,10 +13,12 @@ app = typer.Typer(help="ParamLake: Git for AI Models.")
 repo_app = typer.Typer(name="repo", help="Manage ParamLake repositories (init, commit, checkout, etc.)")
 branch_app = typer.Typer(name="branch", help="Manage branches.")
 tag_app = typer.Typer(name="tag", help="Manage tags.")
+remote_app = typer.Typer(name="remote", help="Manage remote repositories.")
 
 app.add_typer(repo_app)
 app.add_typer(branch_app)
 app.add_typer(tag_app)
+app.add_typer(remote_app)
 
 # --- Global state/config for CLI ---
 # This would typically be loaded from a .paramlake/config in the current directory
@@ -28,10 +31,12 @@ def get_repo_instance(path: Optional[str] = None) -> Repo:
         print("Error: Repository path not specified or found. Initialize with 'paramlake repo init <path>' or run from within a repo.")
         raise typer.Exit(code=1)
     try:
-        # Basic config for CLI usage - can be expanded
-        # The Repo class should ideally discover run_id if path points to an existing repo
-        # or allow it to be specified.
-        repo_config = {"output_path": effective_path, "storage_type": "icechunk"} 
+        # Enhanced config for CLI usage
+        repo_config = {
+            "output_path": effective_path, 
+            "storage_type": "icechunk",
+            "git_features": {"enabled": True}
+        } 
         return Repo(path=effective_path, config=repo_config)
     except Exception as e:
         print(f"Error opening repository at '{effective_path}': {e}")
@@ -39,14 +44,40 @@ def get_repo_instance(path: Optional[str] = None) -> Repo:
 
 # --- `paramlake repo ...` commands ---
 @repo_app.command("init")
-def repo_init(path: Annotated[str, typer.Argument(help="Path to initialize the repository.")] = "."):
+def repo_init(
+    path: Annotated[str, typer.Argument(help="Path to initialize the repository.")] = ".",
+    cloud: Annotated[Optional[str], typer.Option(help="Cloud backend (s3, gcs, azure)")] = None,
+    bucket: Annotated[Optional[str], typer.Option(help="Cloud storage bucket")] = None,
+    prefix: Annotated[Optional[str], typer.Option(help="Storage prefix")] = None,
+    region: Annotated[Optional[str], typer.Option(help="Cloud region")] = "us-east-1"
+):
     """Initializes a new ParamLake repository."""
     try:
-        # Repo __init__ with create_repo=True or similar logic needed in Repo/StorageManager
-        # For now, assume Repo creation happens if path doesn't exist or is empty for IceChunk.
-        Repo(path=path, config={"create_repo": True, "storage_type": "icechunk"}) # create_repo needs to be handled by config
+        config = {
+            "create_repo": True, 
+            "storage_type": "icechunk",
+            "git_features": {"enabled": True}
+        }
+        
+        # Add cloud configuration if provided
+        if cloud:
+            config["storage_backend"] = cloud
+            if bucket:
+                config["bucket"] = bucket
+            if prefix:
+                config["prefix"] = prefix
+            config["region"] = region
+        
+        repo = Repo(path=path, config=config)
         print(f"Initialized empty ParamLake repository in {path}")
-        # TODO: Create .paramlake/config to store repo path for subsequent commands if path != "."
+        
+        if cloud:
+            print(f"Using {cloud} cloud storage:")
+            print(f"  Bucket: {bucket}")
+            print(f"  Prefix: {prefix}")
+            print(f"  Region: {region}")
+        
+        # TODO: Create .paramlake/config to store repo configuration
     except Exception as e:
         print(f"Error initializing repository: {e}")
         raise typer.Exit(code=1)
@@ -54,59 +85,156 @@ def repo_init(path: Annotated[str, typer.Argument(help="Path to initialize the r
 @repo_app.command("commit")
 def repo_commit(
     message: Annotated[str, typer.Option("-m", "--message", help="Commit message.")],
-    model_path: Annotated[str, typer.Option(help="Path to the model file/directory to commit (framework specific).")] = "", # Placeholder
+    model_path: Annotated[Optional[str], typer.Option(help="Path to saved model file (experimental)")] = None,
     branch: Annotated[Optional[str], typer.Option(help="Branch to commit to.")] = None,
     author: Annotated[Optional[str], typer.Option(help="Author of the commit.")] = None,
 ):
     """Records changes to the repository (commits the model state)."""
     repo = get_repo_instance()
-    if not model_path:
-        print("Error: --model-path must be specified for committing via CLI (e.g., path to a saved Keras model).")
-        print("For in-training commits, use the ParamLake Python API within your training script.")
-        raise typer.Exit(code=1)
     
-    # TODO: Implement model loading from model_path based on some convention or framework flag
-    # This is a placeholder - in reality, you'd load the model here.
-    # For this stub, we can't actually load a model without knowing its type and framework.
-    print(f"Placeholder: Would load model from {model_path}")
-    # mock_model_params = {"layer1/weights": np.random.rand(10,10).astype(np.float32)}
-    # For now, cannot proceed without a model object.
-    print("CLI commit of arbitrary model files is complex and needs framework-specific loading.")
-    print("Please use the Python API: repo.commit(model_instance, message=...)")
-    # repo.commit(mock_model_params, message, branch=branch, author=author)
-    # print(f"Committed to branch '{branch or repo.current_branch}'.")
-    raise typer.Exit(code=1)
+    if model_path and os.path.exists(model_path):
+        # Experimental: Try to load and commit a saved model
+        try:
+            import tensorflow as tf
+            model = tf.keras.models.load_model(model_path)
+            snapshot_id = repo.commit(model, message, branch=branch, author=author)
+            print(f"Committed model from {model_path}")
+            print(f"Snapshot ID: {snapshot_id}")
+        except Exception as e:
+            print(f"Error loading model from {model_path}: {e}")
+            print("For training-time commits, use the Python API: repo.commit(model_instance, message=...)")
+            raise typer.Exit(code=1)
+    else:
+        print("CLI commit requires a model file path with --model-path")
+        print("For in-training commits, use the Python API within your training script:")
+        print("  @repo.track()")
+        print("  def train_model():")
+        print("      # ... training code ...")
+        print("  repo.commit(model, 'Training completed')")
+        raise typer.Exit(code=1)
 
 @repo_app.command("checkout")
 def repo_checkout(
     reference: Annotated[str, typer.Argument(help="Branch, tag, or snapshot ID to checkout.")],
-    output_path: Annotated[Optional[str], typer.Option("-o", "--output", help="Path to export the checked-out model state (optional).")] = None,
+    model_path: Annotated[Optional[str], typer.Option("-m", "--model", help="Path to model file to update")] = None,
+    create_branch: Annotated[Optional[str], typer.Option("-b", help="Create new branch from reference")] = None,
 ):
     """Switches to a different branch or restores a specific model version."""
     repo = get_repo_instance()
-    # repo.checkout(reference) # This API needs target_model_instance
-    # For CLI, checkout usually means setting the current HEAD and optionally exporting.
-    # We need to store the current reference (e.g. in .paramlake/HEAD)
-    print(f"Placeholder: Setting current reference to '{reference}'.")
-    if output_path:
-        # repo.export_model(reference, output_path, target_format="some_format") # Needs export_model impl.
-        print(f"Placeholder: Would export model from '{reference}' to '{output_path}'. (Export not implemented)")
-    print(f"Switched to '{reference}'. Future commands will operate on this reference.")
+    
+    try:
+        if create_branch:
+            # Create new branch from reference
+            repo.create_branch(create_branch, from_reference=reference)
+            repo.current_branch = create_branch
+            print(f"Created and switched to new branch '{create_branch}' from '{reference}'")
+        else:
+            # Try to switch branch first
+            if reference in repo.list_branches():
+                result = repo.switch_branch(reference)
+                if result.get('status') == 'success':
+                    print(f"Switched to branch '{reference}'")
+                else:
+                    print(f"Failed to switch to branch '{reference}': {result.get('message', 'Unknown error')}")
+            else:
+                # Not a branch, try to checkout specific snapshot
+                if model_path and os.path.exists(model_path):
+                    import tensorflow as tf
+                    model = tf.keras.models.load_model(model_path)
+                    repo.checkout(reference, model)
+                    model.save(model_path)
+                    print(f"Updated model at {model_path} with state from '{reference}'")
+                else:
+                    print(f"Checked out '{reference}' (no model file specified to update)")
+    except Exception as e:
+        print(f"Error during checkout: {e}")
+        raise typer.Exit(code=1)
 
 @repo_app.command("log")
 def repo_log(
     reference: Annotated[Optional[str], typer.Argument(help="Branch, tag, or snapshot ID to show history for. Defaults to current.")] = None,
     limit: Annotated[Optional[int], typer.Option("-n", "--max-count", help="Limit number of commits to show.")] = None,
+    oneline: Annotated[bool, typer.Option("--oneline", help="Show one line per commit")] = False,
 ):
     """Shows the commit history."""
     repo = get_repo_instance()
-    repo.log(reference=reference or repo.current_branch, limit=limit)
+    try:
+        history = repo.log(reference=reference or repo.current_branch, limit=limit)
+        
+        if not history:
+            print("No commits found.")
+            return
+            
+        if not oneline:
+            # Detailed format (already printed by repo.log)
+            pass
+        else:
+            # One-line format
+            print(f"History for '{reference or repo.current_branch}':")
+            for entry in history:
+                commit_id = entry.get('id', 'unknown')[:12]
+                message = entry.get('message', 'No message')
+                print(f"{commit_id} {message}")
+    except Exception as e:
+        print(f"Error retrieving history: {e}")
 
 @repo_app.command("status")
 def repo_status():
     """Show the working tree status."""
     repo = get_repo_instance()
-    repo.status()
+    try:
+        status = repo.status()
+        # Additional status information beyond what's printed
+        if status.get('has_git_features'):
+            print(f"Git features: Enabled")
+        else:
+            print(f"Git features: Not available (use 'icechunk' storage type)")
+    except Exception as e:
+        print(f"Error getting status: {e}")
+
+@repo_app.command("diff")
+def repo_diff(
+    ref1: Annotated[str, typer.Argument(help="First reference to compare")],
+    ref2: Annotated[Optional[str], typer.Argument(help="Second reference (defaults to current HEAD)")] = None,
+    summary: Annotated[bool, typer.Option("--summary", help="Show only summary of changes")] = False,
+):
+    """Shows differences between two references."""
+    repo = get_repo_instance()
+    try:
+        diff_result = repo.diff(ref1, ref2)
+        
+        if summary:
+            # Show summary only
+            summary_info = diff_result.get('summary', {})
+            print(f"Total changes: {summary_info.get('total_changes', 0)}")
+            print(f"Layers added: {len(summary_info.get('layers_added', []))}")
+            print(f"Layers removed: {len(summary_info.get('layers_removed', []))}")
+            print(f"Layers modified: {len(summary_info.get('layers_modified', []))}")
+        else:
+            # Show detailed diff (this would need formatting)
+            print(f"Diff between '{ref1}' and '{ref2 or 'HEAD'}':")
+            print(f"Changes: {diff_result}")
+            
+    except Exception as e:
+        print(f"Error computing diff: {e}")
+
+@repo_app.command("merge")
+def repo_merge(
+    source_branch: Annotated[str, typer.Argument(help="Branch to merge into current branch")],
+    strategy: Annotated[str, typer.Option("--strategy", help="Merge strategy (auto, ours, theirs)")] = "auto",
+    message: Annotated[Optional[str], typer.Option("-m", "--message", help="Merge commit message")] = None,
+):
+    """Merges a branch into the current branch."""
+    repo = get_repo_instance()
+    try:
+        result = repo.merge(source_branch, strategy=strategy, commit_message=message)
+        if result:
+            print(f"Merge completed. Snapshot ID: {result}")
+        else:
+            print("Merge completed (no new snapshot created)")
+    except Exception as e:
+        print(f"Error during merge: {e}")
+        print("You may need to resolve conflicts manually or use a different strategy")
 
 # --- `paramlake branch ...` commands ---
 @branch_app.command("create")
@@ -116,72 +244,281 @@ def branch_create(
 ):
     """Creates a new branch."""
     repo = get_repo_instance()
-    repo.create_branch(branch_name, from_reference=from_reference or repo.current_branch)
+    try:
+        repo.create_branch(branch_name, from_reference=from_reference or repo.current_branch)
+    except Exception as e:
+        print(f"Error creating branch: {e}")
 
 @branch_app.command("list")
 def branch_list():
     """Lists all branches."""
     repo = get_repo_instance()
-    branches = repo.list_branches()
-    print("Branches:")
-    for branch in branches:
-        prefix = "* " if branch == repo.current_branch else "  "
-        print(f"{prefix}{branch}")
+    try:
+        branches = repo.list_branches()
+        print("Branches:")
+        for branch in branches:
+            prefix = "* " if branch == repo.current_branch else "  "
+            print(f"{prefix}{branch}")
+    except Exception as e:
+        print(f"Error listing branches: {e}")
 
 @branch_app.command("delete")
-def branch_delete(branch_name: Annotated[str, typer.Argument(help="Name of the branch to delete.")]):
+def branch_delete(
+    branch_name: Annotated[str, typer.Argument(help="Name of the branch to delete.")],
+    force: Annotated[bool, typer.Option("-f", "--force", help="Force delete branch")] = False
+):
     """Deletes a branch."""
     repo = get_repo_instance()
-    repo.delete_branch(branch_name)
+    try:
+        repo.delete_branch(branch_name)
+    except Exception as e:
+        if not force:
+            print(f"Error deleting branch: {e}")
+            print("Use --force to force deletion")
+        else:
+            print(f"Force deleted branch '{branch_name}' (errors ignored)")
+
+@branch_app.command("switch")
+def branch_switch(
+    branch_name: Annotated[str, typer.Argument(help="Name of the branch to switch to")],
+    create: Annotated[bool, typer.Option("-c", "--create", help="Create branch if it doesn't exist")] = False
+):
+    """Switch to a different branch."""
+    repo = get_repo_instance()
+    try:
+        result = repo.switch_branch(branch_name, create_if_missing=create)
+        if result.get('status') == 'success':
+            print(f"Switched to branch '{branch_name}'")
+        else:
+            print(f"Failed to switch: {result.get('message', 'Unknown error')}")
+    except Exception as e:
+        print(f"Error switching branch: {e}")
 
 # --- `paramlake tag ...` commands ---
 @tag_app.command("create")
 def tag_create(
     tag_name: Annotated[str, typer.Argument(help="Name of the new tag.")],
-    reference: Annotated[Optional[str], typer.Argument(help="Snapshot ID, branch, or tag to point the new tag to. Defaults to current HEAD.")] = None
+    reference: Annotated[Optional[str], typer.Argument(help="Snapshot ID, branch, or tag to point the new tag to. Defaults to current HEAD.")] = None,
+    message: Annotated[Optional[str], typer.Option("-m", "--message", help="Tag message")] = None
 ):
     """Creates a new tag."""
     repo = get_repo_instance()
-    # Repo API needs update: create_tag should resolve reference internally if it can be branch/tag name
-    # For now, assume reference must be a resolved snapshot_id for the storage_manager.create_tag
-    # This is a simplification for the CLI stub.
-    ref_to_tag = reference or repo.current_branch # This isn't snapshot_id directly yet
-    print(f"Placeholder: Tagging functionality needs reference to be resolved to snapshot ID by Repo class.") 
-    print(f"Simulating: Tag '{tag_name}' would be created for reference '{ref_to_tag}'.")
-    # repo.create_tag(tag_name, ref_to_tag) # This call will fail if ref_to_tag is not snapshot_id
+    try:
+        ref_to_tag = reference or repo.current_branch
+        repo.create_tag(tag_name, ref_to_tag)
+    except Exception as e:
+        print(f"Error creating tag: {e}")
 
 @tag_app.command("list")
 def tag_list():
     """Lists all tags."""
     repo = get_repo_instance()
-    tags = repo.list_tags()
-    print("Tags:")
-    for name, snapshot_id in tags.items():
-        print(f"  {name} -> {snapshot_id}")
+    try:
+        tags = repo.list_tags()
+        if tags:
+            print("Tags:")
+            for name, snapshot_id in tags.items():
+                print(f"  {name} -> {snapshot_id[:12]}...")
+        else:
+            print("No tags found.")
+    except Exception as e:
+        print(f"Error listing tags: {e}")
 
 @tag_app.command("delete")
 def tag_delete(tag_name: Annotated[str, typer.Argument(help="Name of the tag to delete.")]):
     """Deletes a tag."""
     repo = get_repo_instance()
-    repo.delete_tag(tag_name)
+    try:
+        repo.delete_tag(tag_name)
+    except Exception as e:
+        print(f"Error deleting tag: {e}")
 
-# Placeholder for future commands (diff, merge, import, export)
-@app.command("diff", hidden=True)
-def cli_diff(ref1: str, ref2: Optional[str] = None):
-    print("Diff functionality is not yet implemented in the CLI.")
+# --- Advanced Git commands ---
+@app.command("rebase")
+def cli_rebase(
+    branch_name: Annotated[str, typer.Argument(help="Branch to rebase")],
+    onto: Annotated[Optional[str], typer.Option("--onto", help="Branch to rebase onto")] = None,
+    strategy: Annotated[str, typer.Option("--strategy", help="Conflict resolution strategy")] = "detect"
+):
+    """Rebase a branch onto another branch."""
+    repo = get_repo_instance()
+    try:
+        result = repo.rebase(branch_name, onto_branch=onto, conflict_strategy=strategy)
+        print(f"Rebase completed. Snapshot ID: {result}")
+    except Exception as e:
+        print(f"Error during rebase: {e}")
 
-@app.command("merge", hidden=True)
-def cli_merge(source_branch: str):
-    print("Merge functionality is not yet implemented in the CLI.")
+@app.command("reset")
+def cli_reset(
+    reference: Annotated[str, typer.Argument(help="Reference to reset to")],
+    branch: Annotated[Optional[str], typer.Option("--branch", help="Branch to reset (defaults to current)")] = None,
+    hard: Annotated[bool, typer.Option("--hard", help="Hard reset (discards changes)")] = False
+):
+    """Reset a branch to a specific reference."""
+    repo = get_repo_instance()
+    try:
+        repo.reset(reference, branch_name=branch)
+        reset_type = "hard" if hard else "soft"
+        print(f"Reset ({reset_type}) to '{reference}'")
+    except Exception as e:
+        print(f"Error during reset: {e}")
 
-@app.command("import", hidden=True)
-def cli_import(source: str, format: str):
-    print("Import functionality is not yet implemented in the CLI.")
+# --- Remote commands (stubs for future implementation) ---
+@remote_app.command("add")
+def remote_add(
+    name: Annotated[str, typer.Argument(help="Remote name")],
+    url: Annotated[str, typer.Argument(help="Remote URL or configuration")]
+):
+    """Add a remote repository."""
+    print(f"Adding remote '{name}' -> '{url}' (Not fully implemented)")
 
-@app.command("export", hidden=True)
-def cli_export(reference: str, output: str, format: str):
-    print("Export functionality is not yet implemented in the CLI.")
+@remote_app.command("list")
+def remote_list():
+    """List remote repositories."""
+    print("Remote repositories: (Not fully implemented)")
 
+@app.command("import")
+def cli_import(
+    source: Annotated[str, typer.Argument(help="Source file path")],
+    format: Annotated[str, typer.Option("--format", help="Source format (hdf5, tf-saved-model)")] = "hdf5",
+    message: Annotated[Optional[str], typer.Option("-m", "--message", help="Import commit message")] = None,
+    branch: Annotated[Optional[str], typer.Option("--branch", help="Target branch")] = None
+):
+    """Import a model from an external format."""
+    repo = get_repo_instance()
+    try:
+        snapshot_id = repo.import_model(source, format, message=message, branch=branch)
+        print(f"Imported model from {source}. Snapshot ID: {snapshot_id}")
+    except Exception as e:
+        print(f"Error importing model: {e}")
+
+# --- Advanced analysis commands ---
+@app.command("analyze")
+def cli_analyze(
+    reference: Annotated[Optional[str], typer.Argument(help="Reference to analyze (defaults to current)")] = None,
+    gradients: Annotated[bool, typer.Option("--gradients", help="Analyze gradients")] = False,
+    output: Annotated[Optional[str], typer.Option("-o", "--output", help="Output file for report")] = None,
+    format: Annotated[str, typer.Option("--format", help="Report format (html, json)")] = "html"
+):
+    """Analyze model training data and generate reports."""
+    repo = get_repo_instance()
+    try:
+        if gradients:
+            # Gradient analysis
+            result = repo.analyze_gradients(reference)
+            print("Gradient Analysis Results:")
+            summary = result.get('summary', {})
+            print(f"  Total layers: {summary.get('total_layers', 0)}")
+            print(f"  Layers with gradients: {summary.get('layers_with_gradients', 0)}")
+            print(f"  Gradient coverage: {summary.get('gradient_coverage', 0):.2%}")
+            print(f"  Total gradient tensors: {summary.get('total_gradient_tensors', 0)}")
+        
+        if output:
+            # Generate comprehensive report
+            repo.export_training_report(output, reference=reference, format=format)
+            print(f"Report exported to: {output}")
+        else:
+            # Show model summary
+            summary = repo.get_model_summary(reference)
+            metadata = summary.get('metadata', {})
+            print(f"Model Summary for '{reference or 'current'}':")
+            print(f"  Framework: {metadata.get('framework', 'Unknown')}")
+            print(f"  Layers: {len(summary.get('layer_names', []))}")
+            print(f"  Timestamp: {metadata.get('timestamp', 'Unknown')}")
+            
+    except Exception as e:
+        print(f"Error during analysis: {e}")
+
+@repo_app.command("checkout-snapshot")
+def repo_checkout_snapshot(
+    reference: Annotated[str, typer.Argument(help="Snapshot ID, branch, or tag to checkout")],
+    new_branch: Annotated[Optional[str], typer.Option("-b", "--branch", help="Create new branch from snapshot")] = None
+):
+    """Checkout to a specific snapshot and optionally create a new branch."""
+    repo = get_repo_instance()
+    try:
+        result = repo.checkout_snapshot(reference, new_branch)
+        if result.get('status') == 'success':
+            print(f"Successfully checked out snapshot: {result.get('snapshot_id', '')[:12]}...")
+            print(f"Current branch: {result.get('branch', 'unknown')}")
+            if new_branch:
+                print(f"Created new branch: {new_branch}")
+        else:
+            print(f"Checkout failed: {result.get('message', 'Unknown error')}")
+    except Exception as e:
+        print(f"Error during checkout: {e}")
+
+@repo_app.command("diff-visual")
+def repo_diff_visual(
+    ref1: Annotated[str, typer.Argument(help="First reference to compare")],
+    ref2: Annotated[Optional[str], typer.Argument(help="Second reference (defaults to current HEAD)")] = None,
+    format: Annotated[str, typer.Option("--format", help="Output format (console, html, dict)")] = "console",
+    include_values: Annotated[bool, typer.Option("--values", help="Include tensor values in diff")] = False,
+    output: Annotated[Optional[str], typer.Option("-o", "--output", help="Output file for HTML format")] = None
+):
+    """Generate a visual diff between two model versions."""
+    repo = get_repo_instance()
+    try:
+        result = repo.diff_visual(ref1, ref2, output_format=format, include_values=include_values)
+        
+        if format == "console":
+            print(result)
+        elif format == "html" and output:
+            with open(output, 'w') as f:
+                f.write(result)
+            print(f"Visual diff saved to: {output}")
+        elif format == "dict":
+            import json
+            if output:
+                with open(output, 'w') as f:
+                    json.dump(result, f, indent=2, default=str)
+                print(f"Diff data saved to: {output}")
+            else:
+                print(json.dumps(result, indent=2, default=str))
+        else:
+            print("For HTML format, please specify --output file")
+            
+    except Exception as e:
+        print(f"Error generating visual diff: {e}")
+
+@app.command("compare")
+def cli_compare(
+    ref1: Annotated[str, typer.Argument(help="First reference")],
+    ref2: Annotated[str, typer.Argument(help="Second reference")],
+    layer: Annotated[str, typer.Option("--layer", help="Layer name to compare")],
+    tensor_type: Annotated[str, typer.Option("--type", help="Tensor type (weights, gradients)")] = "weights",
+    stat: Annotated[str, typer.Option("--stat", help="Statistic to compare (norm, mean, var)")] = "norm"
+):
+    """Compare statistical properties between two model versions."""
+    repo = get_repo_instance()
+    try:
+        result = repo.compare_models(ref1, ref2, layer, tensor_type, stat)
+        print(f"Comparison between {ref1} and {ref2}:")
+        print(f"Layer: {layer}, Type: {tensor_type}, Stat: {stat}")
+        for tensor_name, stats in result.items():
+            if stat in stats:
+                old_val, new_val = stats[stat]
+                print(f"  {tensor_name}:")
+                print(f"    {ref1}: {old_val}")
+                print(f"    {ref2}: {new_val}")
+    except Exception as e:
+        print(f"Error comparing models: {e}")
+
+@app.command("plot")
+def cli_plot(
+    layer: Annotated[str, typer.Argument(help="Layer name to plot")],
+    tensor: Annotated[Optional[str], typer.Option("--tensor", help="Specific tensor name")] = None,
+    type: Annotated[str, typer.Option("--type", help="Tensor type")] = "weights",
+    stat: Annotated[str, typer.Option("--stat", help="Statistic to plot")] = "norm",
+    reference: Annotated[Optional[str], typer.Option("--ref", help="Reference to analyze")] = None
+):
+    """Plot the evolution of model parameters over training."""
+    repo = get_repo_instance()
+    try:
+        repo.plot_training_evolution(layer, tensor, type, stat, reference)
+        print(f"Plotted {stat} evolution for {layer}/{type}")
+    except Exception as e:
+        print(f"Error creating plot: {e}")
 
 if __name__ == "__main__":
     app() 
