@@ -48,7 +48,7 @@ class GradientCollector:
         self._original_train_step = None
         self._original_apply_gradients = None
     
-    def should_capture_layer(self, layer: tf.keras.layers.Layer) -> bool:
+    def should_capture_layer(self, layer) -> bool:
         """
         Determine if a layer should be captured based on configuration.
         
@@ -82,30 +82,36 @@ class GradientCollector:
         # Default to capturing all layers
         return True
     
-    def _tensor_to_numpy(self, tensor: tf.Tensor) -> np.ndarray:
+    def _tensor_to_numpy(self, tensor) -> np.ndarray:
         """
         Convert a TensorFlow tensor to a NumPy array, handling both eager and graph execution.
         
         Args:
-            tensor: TensorFlow tensor
+            tensor: TensorFlow tensor (if TensorFlow is available)
             
         Returns:
             NumPy array
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
+        
+        tf = require_tensorflow()
         if tf.executing_eagerly():
             return tensor.numpy()
         else:
             # For graph mode, use tf.keras.backend to get the value
             return tf.keras.backend.get_value(tensor)
     
-    def build_variable_mapping(self, model: tf.keras.Model) -> None:
+    def build_variable_mapping(self, model) -> None:
         """
         Build a mapping from variable name to layer and tensor name.
         This is needed to map gradients back to their layers efficiently.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
         self._var_to_layer_map = {}
         
         # Iterate through all layers
@@ -138,8 +144,8 @@ class GradientCollector:
     
     def capture_gradients(
         self,
-        gradients: List[tf.Tensor],
-        variables: List[tf.Variable],
+        gradients: List,
+        variables: List,
         step: Optional[int] = None,
     ) -> None:
         """
@@ -352,7 +358,7 @@ class GradientCollector:
     
     def compute_and_capture_gradients(
         self,
-        model: tf.keras.Model,
+        model,
         inputs: Any,
         targets: Any,
         loss_fn: Optional[Any] = None,
@@ -362,12 +368,14 @@ class GradientCollector:
         Compute and capture gradients for a model.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
             inputs: Model inputs
             targets: Target outputs
             loss_fn: Loss function (if None, uses model's compiled loss)
             step: Current training step (if None, uses internal counter)
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
         # Ensure we have a variable mapping
         if not self._var_to_layer_map:
             self.build_variable_mapping(model)
@@ -400,7 +408,7 @@ class GradientCollector:
             print(f"Error computing gradients:")
             traceback.print_exc()
     
-    def setup_automatic_gradient_tracking(self, model: tf.keras.Model) -> bool:
+    def setup_automatic_gradient_tracking(self, model) -> bool:
         """
         Set up automatic gradient tracking during model training.
         
@@ -430,7 +438,7 @@ class GradientCollector:
         print("Warning: Could not set up automatic gradient tracking. No suitable method found.")
         return False
     
-    def _setup_train_step_override(self, model: tf.keras.Model) -> bool:
+    def _setup_train_step_override(self, model) -> bool:
         """
         Override the model's train_step method to capture gradients.
         
@@ -480,7 +488,7 @@ class GradientCollector:
                 self._original_train_step = None
             return False
     
-    def _setup_optimizer_override(self, optimizer: tf.keras.optimizers.Optimizer) -> bool:
+    def _setup_optimizer_override(self, optimizer) -> bool:
         """
         Override the optimizer's apply_gradients method to capture gradients.
         
@@ -528,7 +536,7 @@ class GradientCollector:
                 self._original_apply_gradients = None
             return False
     
-    def _setup_gradient_callback(self, model: tf.keras.Model) -> bool:
+    def _setup_gradient_callback(self, model) -> bool:
         """
         Set up a callback to capture gradients using GradientTape.
         
@@ -542,7 +550,7 @@ class GradientCollector:
         # We would need to create a custom callback that uses GradientTape
         return False
     
-    def capture_optimizer_gradients(self, optimizer: tf.keras.optimizers.Optimizer, step: Optional[int] = None) -> bool:
+    def capture_optimizer_gradients(self, optimizer, step: Optional[int] = None) -> bool:
         """
         Capture gradients from the optimizer's recorded gradients.
         
@@ -559,7 +567,7 @@ class GradientCollector:
             return True
         return False
     
-    def restore_original_methods(self, model: tf.keras.Model) -> None:
+    def restore_original_methods(self, model) -> None:
         """
         Restore original model methods after training.
         
@@ -576,7 +584,7 @@ class GradientCollector:
             model.optimizer.apply_gradients = self._original_apply_gradients
             self._original_apply_gradients = None
     
-    def _get_all_layers(self, model: tf.keras.Model) -> List[tf.keras.layers.Layer]:
+    def _get_all_layers(self, model) -> List:
         """
         Recursively get all layers in a model, including nested layers.
         
@@ -590,8 +598,8 @@ class GradientCollector:
 
     def capture_gradients_batch(
         self,
-        gradients: List[tf.Tensor],
-        variables: List[tf.Variable],
+        gradients: List,
+        variables: List,
         step: Optional[int] = None,
     ) -> None:
         """
@@ -678,7 +686,7 @@ class GradientCollector:
 
     def compute_and_capture_gradients_batch(
         self,
-        model: tf.keras.Model,
+        model,
         inputs: Any,
         targets: Any,
         loss_fn: Optional[Any] = None,
@@ -726,7 +734,7 @@ class GradientCollector:
             print(f"Error computing gradients in batch mode:")
             traceback.print_exc()
 
-    def capture_optimizer_gradients_batch(self, optimizer: tf.keras.optimizers.Optimizer, step: Optional[int] = None) -> bool:
+    def capture_optimizer_gradients_batch(self, optimizer, step: Optional[int] = None) -> bool:
         """
         Capture gradients from the optimizer's recorded gradients in batch mode.
         
@@ -745,7 +753,7 @@ class GradientCollector:
 
     def compute_gradients_with_tape(
         self,
-        model: tf.keras.Model,
+        model,
         inputs: Any,
         step: Optional[int] = None,
     ) -> None:

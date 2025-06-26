@@ -7,9 +7,15 @@ from typing import Dict, Generator
 
 import numpy as np
 import pytest
-import tensorflow as tf
 
 from paramlake.utils.config import ParamLakeConfig
+from paramlake.utils.framework_utils import HAS_TENSORFLOW, require_tensorflow
+
+# Optional TensorFlow import
+if HAS_TENSORFLOW:
+    import tensorflow as tf
+else:
+    tf = None
 
 
 @pytest.fixture
@@ -59,8 +65,12 @@ def config(temp_dir: str) -> ParamLakeConfig:
 
 
 @pytest.fixture
-def simple_model() -> tf.keras.Model:
+def simple_model():
     """Create a simple model for testing."""
+    if not HAS_TENSORFLOW:
+        pytest.skip("TensorFlow not available")
+    
+    tf = require_tensorflow()
     model = tf.keras.Sequential([
         tf.keras.layers.Dense(10, activation='relu', input_shape=(5,), name='dense_1'),
         tf.keras.layers.Dense(5, activation='relu', name='dense_2'),
@@ -82,16 +92,26 @@ def sample_data() -> Dict[str, np.ndarray]:
     # Create some random data
     np.random.seed(42)
     x_train = np.random.random((100, 5))
-    y_train = tf.keras.utils.to_categorical(
-        np.random.randint(0, 2, size=(100,)), 
-        num_classes=2
-    )
-    
-    x_test = np.random.random((20, 5))
-    y_test = tf.keras.utils.to_categorical(
-        np.random.randint(0, 2, size=(20,)), 
-        num_classes=2
-    )
+    if HAS_TENSORFLOW:
+        tf = require_tensorflow()
+        y_train = tf.keras.utils.to_categorical(
+            np.random.randint(0, 2, size=(100,)), 
+            num_classes=2
+        )
+        
+        x_test = np.random.random((20, 5))
+        y_test = tf.keras.utils.to_categorical(
+            np.random.randint(0, 2, size=(20,)), 
+            num_classes=2
+        )
+    else:
+        # Simple one-hot encoding without TensorFlow
+        y_indices = np.random.randint(0, 2, size=(100,))
+        y_train = np.eye(2)[y_indices]
+        
+        x_test = np.random.random((20, 5))
+        y_indices_test = np.random.randint(0, 2, size=(20,))
+        y_test = np.eye(2)[y_indices_test]
     
     return {
         "x_train": x_train,

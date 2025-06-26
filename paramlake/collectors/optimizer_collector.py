@@ -32,7 +32,7 @@ class OptimizerCollector:
         """
         self.storage = storage_manager
 
-    def _tensor_to_numpy(self, tensor: tf.Tensor) -> np.ndarray:
+    def _tensor_to_numpy(self, tensor) -> np.ndarray:
         """
         Convert a TensorFlow tensor to a NumPy array.
         """
@@ -42,7 +42,7 @@ class OptimizerCollector:
 
     def capture_optimizer_state(
         self,
-        optimizer: tf.keras.optimizers.Optimizer,
+        optimizer,
         step: Optional[int] = None,
         optimizer_name: str = "optimizer"
     ) -> None:
@@ -54,6 +54,10 @@ class OptimizerCollector:
             step: Current training step.
             optimizer_name: A name for the optimizer (e.g., "optimizer", "adam").
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
+        
+        tf = require_tensorflow()
         if not isinstance(optimizer, tf.keras.optimizers.Optimizer):
             print(f"Warning: Provided optimizer is not a tf.keras.optimizers.Optimizer instance. Skipping capture.")
             return

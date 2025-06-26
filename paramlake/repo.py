@@ -19,7 +19,9 @@ from paramlake.utils.framework_utils import (
     safe_import_tensorflow,
     TensorFlowModel,
     TorchModel,
-    JAXArray
+    JAXArray,
+    HAS_TENSORFLOW,
+    require_tensorflow
 )
 
 # Helper to check if Icechunk is available at module level
@@ -410,41 +412,47 @@ class Repo:
                     ignore_layers=None,
                 )
                 
-                # Override Model.fit to include our callback
-                original_fit = tf.keras.Model.fit
-                
-                def patched_fit(self_model, *fit_args, **fit_kwargs):
-                    # Add our callback to the callbacks list
-                    callbacks = fit_kwargs.get('callbacks', [])
-                    if callbacks is None:
-                        callbacks = []
-                    elif not isinstance(callbacks, list):
-                        callbacks = [callbacks]
+                # Override Model.fit to include our callback (only if TensorFlow is available)
+                if HAS_TENSORFLOW:
+                    tf = require_tensorflow()
+                    original_fit = tf.keras.Model.fit
                     
-                    # Add our callback if not already there
-                    if callback not in callbacks:
-                        callbacks.append(callback)
+                    def patched_fit(self_model, *fit_args, **fit_kwargs):
+                        # Add our callback to the callbacks list
+                        callbacks = fit_kwargs.get('callbacks', [])
+                        if callbacks is None:
+                            callbacks = []
+                        elif not isinstance(callbacks, list):
+                            callbacks = [callbacks]
+                        
+                        # Add our callback if not already there
+                        if callback not in callbacks:
+                            callbacks.append(callback)
+                        
+                        fit_kwargs['callbacks'] = callbacks
+                        return original_fit(self_model, *fit_args, **fit_kwargs)
                     
-                    fit_kwargs['callbacks'] = callbacks
-                    return original_fit(self_model, *fit_args, **fit_kwargs)
-                
-                # Replace the fit method temporarily
-                tf.keras.Model.fit = patched_fit
+                    # Replace the fit method temporarily
+                    tf.keras.Model.fit = patched_fit
                 
                 try:
                     # Call the decorated function
                     result = func(*args, **func_kwargs)
                     
                     # If the function returned a model, capture initial state
-                    if isinstance(result, tf.keras.Model):
-                        if callback.weight_collector is not None:
-                            callback.weight_collector.capture_model_weights(result, step=0)
+                    if HAS_TENSORFLOW:
+                        tf = require_tensorflow()
+                        if isinstance(result, tf.keras.Model):
+                            if callback.weight_collector is not None:
+                                callback.weight_collector.capture_model_weights(result, step=0)
                     
                     return result
                 
                 finally:
-                    # Always restore original fit method
-                    tf.keras.Model.fit = original_fit
+                    # Always restore original fit method (only if TensorFlow is available)
+                    if HAS_TENSORFLOW:
+                        tf = require_tensorflow()
+                        tf.keras.Model.fit = original_fit
                     
                     # Ensure final commit if needed
                     try:
@@ -1007,38 +1015,42 @@ class Repo:
 
     def _extract_layer_parameters(self, model: Any, layer_names: List[str]) -> Dict[str, np.ndarray]:
         """Extract parameters from specific layers only."""
-        if isinstance(model, tf.keras.Model):
-            params = {}
-            
-            # Create a mapping of weight objects to their layer information
-            weight_to_layer = {}
-            for layer in model.layers:
-                if layer.name in layer_names:  # Only process specified layers
-                    for weight in layer.weights:
-                        weight_to_layer[id(weight)] = layer.name
-            
-            for i, weight_var in enumerate(model.weights):
-                # Check if this weight belongs to one of the target layers
-                layer_name = weight_to_layer.get(id(weight_var))
-                if layer_name is not None:  # Only include weights from target layers
-                    weight_name = weight_var.name if weight_var.name else f"weight_{i}"
-                    
-                    # Combine layer name and weight name for uniqueness
-                    unique_name = f"{layer_name}/{weight_name}"
-                    
-                    # Debug logging if verbose mode is enabled
-                    if self.config.get("verbose", False):
-                        print(f"Extracting layer parameter: '{unique_name}' -> shape: {weight_var.shape}")
-                    
-                    params[unique_name] = weight_var.numpy()
-            return params
+        if HAS_TENSORFLOW:
+            tf = require_tensorflow()
+            if isinstance(model, tf.keras.Model):
+                params = {}
+                
+                # Create a mapping of weight objects to their layer information
+                weight_to_layer = {}
+                for layer in model.layers:
+                    if layer.name in layer_names:  # Only process specified layers
+                        for weight in layer.weights:
+                            weight_to_layer[id(weight)] = layer.name
+                
+                for i, weight_var in enumerate(model.weights):
+                    # Check if this weight belongs to one of the target layers
+                    layer_name = weight_to_layer.get(id(weight_var))
+                    if layer_name is not None:  # Only include weights from target layers
+                        weight_name = weight_var.name if weight_var.name else f"weight_{i}"
+                        
+                        # Combine layer name and weight name for uniqueness
+                        unique_name = f"{layer_name}/{weight_name}"
+                        
+                        # Debug logging if verbose mode is enabled
+                        if self.config.get("verbose", False):
+                            print(f"Extracting layer parameter: '{unique_name}' -> shape: {weight_var.shape}")
+                        
+                        params[unique_name] = weight_var.numpy()
+                return params
         # TODO: Add support for PyTorch (model.state_dict()), etc.
         raise NotImplementedError("Layer parameter extraction not implemented for this model type.")
 
     def _get_model_layer_names(self, model: Any) -> List[str]:
         """Get all layer names from a model."""
-        if isinstance(model, tf.keras.Model):
-            return [layer.name for layer in model.layers]
+        if HAS_TENSORFLOW:
+            tf = require_tensorflow()
+            if isinstance(model, tf.keras.Model):
+                return [layer.name for layer in model.layers]
         raise NotImplementedError("Layer name extraction not implemented for this model type.")
 
     def commit_layer(
@@ -1146,15 +1158,19 @@ class Repo:
             return
         
         # Apply the layer parameters to the model
-        if isinstance(target_model_instance, tf.keras.Model):
-            self._apply_layer_parameters_to_model(
-                target_model_instance, 
-                layer_parameters, 
-                layer_names,
-                strategy
-            )
+        if HAS_TENSORFLOW:
+            tf = require_tensorflow()
+            if isinstance(target_model_instance, tf.keras.Model):
+                self._apply_layer_parameters_to_model(
+                    target_model_instance, 
+                    layer_parameters, 
+                    layer_names,
+                    strategy
+                )
+            else:
+                raise NotImplementedError("Layer checkout not implemented for this model type.")
         else:
-            raise NotImplementedError("Layer checkout not implemented for this model type.")
+            raise NotImplementedError("Layer checkout requires TensorFlow. Install with: pip install 'paramlake[tf]'")
         
         layers_str = ', '.join(layer_names)
         print(f"✓ Checked out layers [{layers_str}] from '{reference}' using strategy '{strategy}'")

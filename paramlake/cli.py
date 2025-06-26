@@ -314,7 +314,13 @@ def repo_commit(
     if model_path and os.path.exists(model_path):
         # Experimental: Try to load and commit a saved model
         try:
-            import tensorflow as tf
+            from paramlake.utils.framework_utils import HAS_TENSORFLOW, require_tensorflow
+            if not HAS_TENSORFLOW:
+                print("Error: TensorFlow is required for model loading.")
+                print("Install with: pip install 'paramlake[tf]' or pip install tensorflow")
+                raise typer.Exit(code=1)
+            
+            tf = require_tensorflow()
             model = tf.keras.models.load_model(model_path)
             snapshot_id = repo.commit(model, message, branch=branch, author=author)
             print(f"Committed model from {model_path}")
@@ -358,7 +364,13 @@ def repo_checkout(
             else:
                 # Not a branch, try to checkout specific snapshot
                 if model_path and os.path.exists(model_path):
-                    import tensorflow as tf
+                    from paramlake.utils.framework_utils import HAS_TENSORFLOW, require_tensorflow
+                    if not HAS_TENSORFLOW:
+                        print("Error: TensorFlow is required for model operations.")
+                        print("Install with: pip install 'paramlake[tf]' or pip install tensorflow")
+                        raise typer.Exit(code=1)
+                    
+                    tf = require_tensorflow()
                     model = tf.keras.models.load_model(model_path)
                     repo.checkout(reference, model)
                     model.save(model_path)

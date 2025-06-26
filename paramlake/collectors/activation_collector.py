@@ -48,12 +48,12 @@ class ActivationCollector:
         # Sample input for capturing activations
         self.sample_input = None
     
-    def should_capture_layer(self, layer: tf.keras.layers.Layer) -> bool:
+    def should_capture_layer(self, layer) -> bool:
         """
         Determine if a layer should be captured based on configuration.
         
         Args:
-            layer: TensorFlow layer
+            layer: TensorFlow layer (if TensorFlow is available)
             
         Returns:
             True if the layer should be captured, False otherwise
@@ -86,31 +86,39 @@ class ActivationCollector:
         # Default to capturing all layers
         return True
     
-    def _tensor_to_numpy(self, tensor: tf.Tensor) -> np.ndarray:
+    def _tensor_to_numpy(self, tensor) -> np.ndarray:
         """
         Convert a TensorFlow tensor to a NumPy array, handling both eager and graph execution.
         
         Args:
-            tensor: TensorFlow tensor
+            tensor: TensorFlow tensor (if TensorFlow is available)
             
         Returns:
             NumPy array
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
+        
+        tf = require_tensorflow()
         if tf.executing_eagerly():
             return tensor.numpy()
         else:
             # For graph mode, use tf.keras.backend to get the value
             return tf.keras.backend.get_value(tensor)
 
-    def setup_activation_capture(self, model: tf.keras.Model) -> None:
+    def setup_activation_capture(self, model) -> None:
         """
         Set up activation capture for a model.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
         # Clear previous activation functions
         self.activation_functions = {}
+        
+        tf = require_tensorflow()
         
         # For Keras Functional API and Sequential models,
         # we can create a model with multiple outputs to get activations
@@ -120,13 +128,14 @@ class ActivationCollector:
             # For subclassed models, we need to use a different approach
             self._setup_subclassed_activation_capture(model)
     
-    def _setup_functional_activation_capture(self, model: tf.keras.Model) -> None:
+    def _setup_functional_activation_capture(self, model) -> None:
         """
         Set up activation capture for a Functional API or Sequential model.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
         """
+        tf = require_tensorflow()
         # Get all layers to capture
         layers_to_capture = []
         for layer in model.layers:
@@ -197,12 +206,12 @@ class ActivationCollector:
         # Fall back to subclassed approach if functional doesn't work
         self._setup_subclassed_activation_capture(model)
     
-    def _setup_subclassed_activation_capture(self, model: tf.keras.Model) -> None:
+    def _setup_subclassed_activation_capture(self, model) -> None:
         """
         Set up activation capture for a subclassed model using a custom callback approach.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
         """
         # Dictionary to store activations
         activations = {}
@@ -229,7 +238,7 @@ class ActivationCollector:
     
     def capture_activations(
         self,
-        model: tf.keras.Model,
+        model,
         inputs: Any,
         step: Optional[int] = None,
     ) -> None:
@@ -237,10 +246,12 @@ class ActivationCollector:
         Capture activations for a model.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
             inputs: Model inputs
             step: Current training step (if None, uses internal counter)
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
         # Ensure activation capture is set up
         if not self.activation_functions:
             try:
@@ -405,23 +416,27 @@ class ActivationCollector:
         """
         self.sample_input = sample_input
     
-    def create_sample_input(self, model: tf.keras.Model, batch_size: int = 1) -> Any:
+    def create_sample_input(self, model, batch_size: int = 1) -> Any:
         """
         Create a sample input for the model.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
             batch_size: Batch size for sample input
             
         Returns:
             Sample input for the model
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
         # First check if we already have a sample input
         if self.sample_input is not None:
             return self.sample_input
             
         # Try to get the input shape from the model
         input_shape = None
+        
+        tf = require_tensorflow()
         
         # For Sequential models with an input layer
         if isinstance(model, tf.keras.Sequential) and model.layers and isinstance(model.layers[0], tf.keras.layers.InputLayer):
@@ -478,20 +493,22 @@ class ActivationCollector:
     
     def capture_activations_batch(
         self,
-        model: tf.keras.Model,
+        model,
         inputs: Any,
-        layers_to_capture: Optional[List[tf.keras.layers.Layer]] = None,
+        layers_to_capture: Optional[List] = None,
         step: Optional[int] = None,
     ) -> None:
         """
         Capture activations for multiple layers in batch mode for better performance.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
             inputs: Model inputs
             layers_to_capture: List of layers to capture (if None, uses filtered model layers)
             step: Current training step (if None, uses internal counter)
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
         # Ensure activation capture is set up
         if not self.activation_functions:
             try:
@@ -611,6 +628,7 @@ class ActivationCollector:
                     for layer_name, activation in activations.items():
                         try:
                             # Convert to numpy array
+                            tf = require_tensorflow()
                             if isinstance(activation, tf.Tensor):
                                 activation_numpy = self._tensor_to_numpy(activation)
                             else:
@@ -671,12 +689,12 @@ class ActivationCollector:
             print(f"Error capturing activations in batch mode: {e}")
             traceback.print_exc()
     
-    def _get_all_layers(self, model: tf.keras.Model) -> List[tf.keras.layers.Layer]:
+    def _get_all_layers(self, model) -> List:
         """
         Recursively get all layers in a model, including nested layers.
         
         Args:
-            model: TensorFlow model
+            model: TensorFlow model (if TensorFlow is available)
             
         Returns:
             List of all layers

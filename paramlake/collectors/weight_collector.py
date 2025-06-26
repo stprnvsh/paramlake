@@ -97,7 +97,7 @@ class WeightCollector:
         # Avoid duplicate collection
         return epoch != self.last_collection_epoch
 
-    def on_train_begin(self, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+    def on_train_begin(self, model, logs: Optional[Dict[str, Any]] = None) -> None:
         """Called at the beginning of training."""
         # Detect current branch if git is enabled
         if self.git_enabled and hasattr(self.storage_manager, 'get_current_branch'):
@@ -120,7 +120,7 @@ class WeightCollector:
             except Exception as e:
                 print(f"Warning: Could not store model metadata: {e}")
 
-    def on_epoch_begin(self, epoch: int, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+    def on_epoch_begin(self, epoch: int, model, logs: Optional[Dict[str, Any]] = None) -> None:
         """Called at the beginning of each epoch."""
         # Update current branch if it might have changed
         if self.git_enabled and hasattr(self.storage_manager, 'get_current_branch'):
@@ -129,13 +129,13 @@ class WeightCollector:
             except Exception:
                 pass
 
-    def on_epoch_end(self, epoch: int, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+    def on_epoch_end(self, epoch: int, model, logs: Optional[Dict[str, Any]] = None) -> None:
         """Called at the end of each epoch."""
         if self.should_collect(epoch):
             self.collect_weights(model, epoch, logs)
             self.last_collection_epoch = epoch
 
-    def collect_weights(self, model: tf.keras.Model, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
+    def collect_weights(self, model, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
         """
         Collect model weights with git-aware metadata.
         
@@ -160,7 +160,7 @@ class WeightCollector:
                 import traceback
                 traceback.print_exc()
 
-    def _should_track_layer(self, layer: tf.keras.layers.Layer) -> bool:
+    def _should_track_layer(self, layer) -> bool:
         """
         Determine if a layer should be tracked.
         
@@ -183,7 +183,7 @@ class WeightCollector:
         # Default: track layers with weights
         return len(layer.weights) > 0
 
-    def _collect_layer_weights(self, layer: tf.keras.layers.Layer, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
+    def _collect_layer_weights(self, layer, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
         """
         Collect weights from a specific layer.
         
@@ -267,12 +267,12 @@ class WeightCollector:
         except Exception:
             return "unknown"
 
-    def on_batch_end(self, batch: int, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+    def on_batch_end(self, batch: int, model, logs: Optional[Dict[str, Any]] = None) -> None:
         """Called at the end of each batch."""
         # Weight collection typically happens at epoch level, not batch level
         pass
 
-    def on_train_end(self, model: tf.keras.Model, logs: Optional[Dict[str, Any]] = None) -> None:
+    def on_train_end(self, model, logs: Optional[Dict[str, Any]] = None) -> None:
         """Called at the end of training."""
         # Final collection if needed
         if hasattr(self, 'last_collection_epoch'):
@@ -297,7 +297,7 @@ class WeightCollector:
             'ignored_layers': len(self.ignore_layers)
         }
 
-    def should_capture_layer(self, layer: tf.keras.layers.Layer) -> bool:
+    def should_capture_layer(self, layer) -> bool:
         """
         Determine if a layer should be captured based on configuration.
         
@@ -386,7 +386,7 @@ class WeightCollector:
     
     def capture_layer_weights(
         self,
-        layer: tf.keras.layers.Layer,
+        layer,
         step: Optional[int] = None,
     ) -> None:
         """
@@ -421,16 +421,20 @@ class WeightCollector:
         if self.capture_non_trainable and layer.non_trainable_weights:
             self._store_weight_tensors(layer.non_trainable_weights, layer_group, "non_trainable", step)
     
-    def _tensor_to_numpy(self, tensor: tf.Tensor) -> np.ndarray:
+    def _tensor_to_numpy(self, tensor) -> np.ndarray:
         """
         Convert a TensorFlow tensor to a NumPy array, handling both eager and graph execution.
         
         Args:
-            tensor: TensorFlow tensor
+            tensor: TensorFlow tensor (if TensorFlow is available)
             
         Returns:
             NumPy array
         """
+        if not HAS_TENSORFLOW:
+            require_tensorflow()
+        
+        tf = require_tensorflow()
         if tf.executing_eagerly():
             return tensor.numpy()
         else:
@@ -455,7 +459,7 @@ class WeightCollector:
     
     def _store_weight_tensors(
         self,
-        weights: List[tf.Variable],
+        weights: List,
         layer_group: Any,
         tensor_type: str,
         step: Optional[int] = None,
@@ -527,7 +531,7 @@ class WeightCollector:
             
         self.layer_sizes[layer_name] = layer_size
     
-    def _store_layer_metadata(self, layer: tf.keras.layers.Layer, layer_group: Any) -> None:
+    def _store_layer_metadata(self, layer, layer_group: Any) -> None:
         """
         Store metadata for a layer.
         
@@ -575,7 +579,7 @@ class WeightCollector:
     
     def capture_model_weights(
         self,
-        model: tf.keras.Model,
+        model,
         step: Optional[int] = None,
         recursive: bool = True,
     ) -> None:
@@ -635,7 +639,7 @@ class WeightCollector:
             for layer in layers:
                 self.capture_layer_weights(layer, step)
     
-    def _get_all_layers(self, model: tf.keras.Model) -> List[tf.keras.layers.Layer]:
+    def _get_all_layers(self, model) -> List:
         """
         Recursively get all layers in a model, including nested layers.
         
@@ -649,7 +653,7 @@ class WeightCollector:
 
     def capture_weights_batch(
         self,
-        layer: tf.keras.layers.Layer,
+        layer,
         step: Optional[int] = None,
         tensor_type: str = "weights"
     ) -> None:
@@ -735,7 +739,7 @@ class WeightCollector:
 
     def capture_model_weights_batch(
         self,
-        model: tf.keras.Model,
+        model,
         step: Optional[int] = None,
         recursive: bool = True,
     ) -> None:
