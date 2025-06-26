@@ -37,6 +37,100 @@ class ParamLakeConfig:
         "capture_activations": False,
         "capture_optimizer_state": True,  # Added new option
         
+        # Repository connection and discovery options
+        "repository": {
+            "auto_discovery": True,  # Automatically search for repositories in parent directories
+            "discovery_depth": 10,  # Maximum depth to search for repositories
+            "connect_existing": False,  # Flag to indicate connecting to existing repo
+            "validate_on_connect": True,  # Validate repository health when connecting
+            "create_repo": False,  # Whether to create a new repository
+            "allow_missing_metadata": False,  # Allow connection even if some metadata is missing
+            "repair_on_connect": False,  # Attempt to repair issues when connecting
+            "backup_before_repair": True,  # Create backup before attempting repairs
+            "connection_timeout": 30,  # Timeout for repository connection in seconds
+        },
+        
+        # Repository metadata and tracking
+        "metadata": {
+            "track_connection_history": True,  # Track when and how repository was accessed
+            "store_user_info": True,  # Store user information in repository metadata
+            "store_environment_info": True,  # Store environment information
+            "connection_log_file": None,  # File to log connection attempts (None for no logging)
+            "last_accessed_file": ".last_accessed",  # File to track last access time
+            "user_preferences_file": ".user_preferences",  # User-specific preferences
+        },
+        
+        # Multi-repository management
+        "multi_repo": {
+            "enabled": False,  # Enable multi-repository features
+            "default_repo": None,  # Default repository name or path
+            "repo_registry": {},  # Registry of known repositories
+            "auto_switch": False,  # Automatically switch to most appropriate repo
+            "sync_preferences": True,  # Sync preferences across repositories
+        },
+        
+        # Repository search and indexing
+        "discovery": {
+            "search_patterns": [
+                "*.zarr",
+                "*.paramlake",
+                ".icechunk",
+                "icechunk.json",
+                ".zarray",
+                ".zgroup",
+                "zarr.json",
+                ".paramlake",
+                "paramlake.json"
+            ],
+            "exclude_patterns": [
+                "node_modules",
+                ".git",
+                "__pycache__",
+                "*.tmp",
+                "*.temp"
+            ],
+            "max_search_time": 5,  # Maximum time to spend searching (seconds)
+            "cache_search_results": True,  # Cache search results
+            "search_cache_ttl": 3600,  # Search cache time-to-live (seconds)
+        },
+        
+        # Connection validation and health checks
+        "validation": {
+            "check_storage_integrity": True,  # Check storage backend integrity
+            "check_metadata_consistency": True,  # Check metadata consistency
+            "check_branch_validity": True,  # Validate branch references
+            "check_tag_validity": True,  # Validate tag references
+            "check_snapshot_integrity": False,  # Deep validation of snapshots (expensive)
+            "max_validation_time": 10,  # Maximum time for validation (seconds)
+            "validation_log_level": "WARNING",  # Log level for validation messages
+        },
+        
+        # Repository repair and recovery
+        "repair": {
+            "auto_repair_minor_issues": False,  # Automatically fix minor issues
+            "backup_before_repair": True,  # Always backup before repairs
+            "repair_log_file": None,  # Log file for repair operations
+            "max_repair_attempts": 3,  # Maximum repair attempts
+            "repair_strategies": ["metadata", "references", "indexes"],  # Repair strategies to try
+        },
+        
+        # Workspace and project management
+        "workspace": {
+            "enabled": False,  # Enable workspace features
+            "workspace_file": ".paramlake/workspace.json",  # Workspace configuration file
+            "project_roots": [],  # List of project root directories
+            "auto_detect_projects": True,  # Automatically detect project boundaries
+            "share_repos_across_projects": True,  # Allow sharing repos across projects
+        },
+        
+        # Repository aliases and shortcuts
+        "aliases": {
+            "enabled": True,  # Enable repository aliases
+            "alias_file": ".paramlake/aliases.json",  # File to store aliases
+            "auto_create_aliases": True,  # Automatically create aliases for frequently used repos
+            "global_aliases": {},  # Global aliases available across all projects
+        },
+        
         # Layer filtering
         "include_layers": None,  # None means include all
         "exclude_layers": None,  # None means exclude none
@@ -475,4 +569,218 @@ class ParamLakeConfig:
     def export_config(self, file_path: str) -> None:
         """Export current configuration to a YAML file."""
         with open(file_path, 'w') as f:
-            yaml.dump(self.config, f, default_flow_style=False, indent=2) 
+            yaml.dump(self.config, f, default_flow_style=False, indent=2)
+
+    # Repository connection helper methods
+    def get_repository_config(self) -> Dict[str, Any]:
+        """Get repository-specific configuration."""
+        return self.config.get("repository", {})
+    
+    def get_discovery_config(self) -> Dict[str, Any]:
+        """Get repository discovery configuration."""
+        return self.config.get("discovery", {})
+    
+    def get_validation_config(self) -> Dict[str, Any]:
+        """Get repository validation configuration."""
+        return self.config.get("validation", {})
+    
+    def get_repair_config(self) -> Dict[str, Any]:
+        """Get repository repair configuration."""
+        return self.config.get("repair", {})
+    
+    def get_metadata_config(self) -> Dict[str, Any]:
+        """Get metadata tracking configuration."""
+        return self.config.get("metadata", {})
+    
+    def get_workspace_config(self) -> Dict[str, Any]:
+        """Get workspace management configuration."""
+        return self.config.get("workspace", {})
+    
+    def get_aliases_config(self) -> Dict[str, Any]:
+        """Get repository aliases configuration."""
+        return self.config.get("aliases", {})
+    
+    def get_multi_repo_config(self) -> Dict[str, Any]:
+        """Get multi-repository management configuration."""
+        return self.config.get("multi_repo", {})
+    
+    def is_auto_discovery_enabled(self) -> bool:
+        """Check if automatic repository discovery is enabled."""
+        return self.config.get("repository", {}).get("auto_discovery", True)
+    
+    def should_validate_on_connect(self) -> bool:
+        """Check if repository validation should be performed on connection."""
+        return self.config.get("repository", {}).get("validate_on_connect", True)
+    
+    def should_connect_existing(self) -> bool:
+        """Check if this is a connection to an existing repository."""
+        return self.config.get("repository", {}).get("connect_existing", False) or self.config.get("connect_existing", False)
+    
+    def should_create_repo(self) -> bool:
+        """Check if a new repository should be created."""
+        return self.config.get("repository", {}).get("create_repo", False) or self.config.get("create_repo", False)
+    
+    def should_allow_missing_metadata(self) -> bool:
+        """Check if connection should be allowed even with missing metadata."""
+        return self.config.get("repository", {}).get("allow_missing_metadata", False)
+    
+    def should_repair_on_connect(self) -> bool:
+        """Check if repository repair should be attempted on connection."""
+        return self.config.get("repository", {}).get("repair_on_connect", False)
+    
+    def get_discovery_depth(self) -> int:
+        """Get the maximum depth to search for repositories."""
+        return self.config.get("repository", {}).get("discovery_depth", 10)
+    
+    def get_connection_timeout(self) -> int:
+        """Get the connection timeout in seconds."""
+        return self.config.get("repository", {}).get("connection_timeout", 30)
+    
+    def get_search_patterns(self) -> List[str]:
+        """Get patterns to search for when discovering repositories."""
+        return self.config.get("discovery", {}).get("search_patterns", [
+            "*.zarr", "*.paramlake", ".icechunk", "icechunk.json",
+            ".zarray", ".zgroup", "zarr.json", ".paramlake", "paramlake.json"
+        ])
+    
+    def get_exclude_patterns(self) -> List[str]:
+        """Get patterns to exclude when searching for repositories."""
+        return self.config.get("discovery", {}).get("exclude_patterns", [
+            "node_modules", ".git", "__pycache__", "*.tmp", "*.temp"
+        ])
+    
+    def get_max_search_time(self) -> int:
+        """Get maximum time to spend searching for repositories."""
+        return self.config.get("discovery", {}).get("max_search_time", 5)
+    
+    def should_cache_search_results(self) -> bool:
+        """Check if search results should be cached."""
+        return self.config.get("discovery", {}).get("cache_search_results", True)
+    
+    def get_search_cache_ttl(self) -> int:
+        """Get search cache time-to-live in seconds."""
+        return self.config.get("discovery", {}).get("search_cache_ttl", 3600)
+    
+    def should_check_storage_integrity(self) -> bool:
+        """Check if storage integrity should be validated."""
+        return self.config.get("validation", {}).get("check_storage_integrity", True)
+    
+    def should_check_metadata_consistency(self) -> bool:
+        """Check if metadata consistency should be validated."""
+        return self.config.get("validation", {}).get("check_metadata_consistency", True)
+    
+    def should_check_branch_validity(self) -> bool:
+        """Check if branch validity should be validated."""
+        return self.config.get("validation", {}).get("check_branch_validity", True)
+    
+    def should_check_tag_validity(self) -> bool:
+        """Check if tag validity should be validated."""
+        return self.config.get("validation", {}).get("check_tag_validity", True)
+    
+    def should_check_snapshot_integrity(self) -> bool:
+        """Check if snapshot integrity should be deeply validated."""
+        return self.config.get("validation", {}).get("check_snapshot_integrity", False)
+    
+    def get_max_validation_time(self) -> int:
+        """Get maximum time for validation in seconds."""
+        return self.config.get("validation", {}).get("max_validation_time", 10)
+    
+    def get_validation_log_level(self) -> str:
+        """Get log level for validation messages."""
+        return self.config.get("validation", {}).get("validation_log_level", "WARNING")
+    
+    def should_auto_repair_minor_issues(self) -> bool:
+        """Check if minor issues should be automatically repaired."""
+        return self.config.get("repair", {}).get("auto_repair_minor_issues", False)
+    
+    def should_backup_before_repair(self) -> bool:
+        """Check if backup should be created before repairs."""
+        return self.config.get("repair", {}).get("backup_before_repair", True)
+    
+    def get_max_repair_attempts(self) -> int:
+        """Get maximum number of repair attempts."""
+        return self.config.get("repair", {}).get("max_repair_attempts", 3)
+    
+    def get_repair_strategies(self) -> List[str]:
+        """Get list of repair strategies to try."""
+        return self.config.get("repair", {}).get("repair_strategies", ["metadata", "references", "indexes"])
+    
+    def should_track_connection_history(self) -> bool:
+        """Check if connection history should be tracked."""
+        return self.config.get("metadata", {}).get("track_connection_history", True)
+    
+    def should_store_user_info(self) -> bool:
+        """Check if user information should be stored."""
+        return self.config.get("metadata", {}).get("store_user_info", True)
+    
+    def should_store_environment_info(self) -> bool:
+        """Check if environment information should be stored."""
+        return self.config.get("metadata", {}).get("store_environment_info", True)
+    
+    def get_connection_log_file(self) -> Optional[str]:
+        """Get path to connection log file."""
+        return self.config.get("metadata", {}).get("connection_log_file")
+    
+    def get_last_accessed_file(self) -> str:
+        """Get filename for last accessed tracking."""
+        return self.config.get("metadata", {}).get("last_accessed_file", ".last_accessed")
+    
+    def get_user_preferences_file(self) -> str:
+        """Get filename for user preferences."""
+        return self.config.get("metadata", {}).get("user_preferences_file", ".user_preferences")
+    
+    def is_workspace_enabled(self) -> bool:
+        """Check if workspace features are enabled."""
+        return self.config.get("workspace", {}).get("enabled", False)
+    
+    def get_workspace_file(self) -> str:
+        """Get workspace configuration file path."""
+        return self.config.get("workspace", {}).get("workspace_file", ".paramlake/workspace.json")
+    
+    def get_project_roots(self) -> List[str]:
+        """Get list of project root directories."""
+        return self.config.get("workspace", {}).get("project_roots", [])
+    
+    def should_auto_detect_projects(self) -> bool:
+        """Check if project boundaries should be automatically detected."""
+        return self.config.get("workspace", {}).get("auto_detect_projects", True)
+    
+    def should_share_repos_across_projects(self) -> bool:
+        """Check if repositories should be shared across projects."""
+        return self.config.get("workspace", {}).get("share_repos_across_projects", True)
+    
+    def is_aliases_enabled(self) -> bool:
+        """Check if repository aliases are enabled."""
+        return self.config.get("aliases", {}).get("enabled", True)
+    
+    def get_alias_file(self) -> str:
+        """Get alias configuration file path."""
+        return self.config.get("aliases", {}).get("alias_file", ".paramlake/aliases.json")
+    
+    def should_auto_create_aliases(self) -> bool:
+        """Check if aliases should be automatically created."""
+        return self.config.get("aliases", {}).get("auto_create_aliases", True)
+    
+    def get_global_aliases(self) -> Dict[str, str]:
+        """Get global repository aliases."""
+        return self.config.get("aliases", {}).get("global_aliases", {})
+    
+    def is_multi_repo_enabled(self) -> bool:
+        """Check if multi-repository features are enabled."""
+        return self.config.get("multi_repo", {}).get("enabled", False)
+    
+    def get_default_repo(self) -> Optional[str]:
+        """Get default repository name or path."""
+        return self.config.get("multi_repo", {}).get("default_repo")
+    
+    def get_repo_registry(self) -> Dict[str, Any]:
+        """Get registry of known repositories."""
+        return self.config.get("multi_repo", {}).get("repo_registry", {})
+    
+    def should_auto_switch_repos(self) -> bool:
+        """Check if repository switching should be automatic."""
+        return self.config.get("multi_repo", {}).get("auto_switch", False)
+    
+    def should_sync_preferences(self) -> bool:
+        """Check if preferences should be synced across repositories."""
+        return self.config.get("multi_repo", {}).get("sync_preferences", True) 

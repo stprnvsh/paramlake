@@ -5,7 +5,14 @@ Activation collector for TensorFlow models.
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import tensorflow as tf
+from paramlake.utils.framework_utils import HAS_TENSORFLOW, require_tensorflow
+
+# Optional TensorFlow import
+if HAS_TENSORFLOW:
+    import tensorflow as tf
+else:
+    tf = None
+
 
 from paramlake.storage.storage_interface import StorageInterface
 from paramlake.utils.model_utils import get_all_layers, process_tensors_batch

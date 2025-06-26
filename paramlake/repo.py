@@ -3,12 +3,24 @@ Provides the Repo class for interacting with a ParamLake version-controlled repo
 """
 from typing import Any, Dict, List, Optional, Union, Callable
 import functools
-import tensorflow as tf # Assuming TensorFlow for now for model type hint
+import os
+import json
+from pathlib import Path
 import numpy as np
 
 from paramlake.storage.storage_interface import StorageInterface
 from paramlake.storage.factory import create_storage_manager
 from paramlake.utils.config import ParamLakeConfig
+from paramlake.utils.framework_utils import (
+    detect_model_framework,
+    extract_model_parameters,
+    apply_parameters_to_model,
+    framework_info,
+    safe_import_tensorflow,
+    TensorFlowModel,
+    TorchModel,
+    JAXArray
+)
 
 # Helper to check if Icechunk is available at module level
 try:
@@ -18,8 +30,272 @@ except ImportError:
     HAS_ICECHUNK = False
 
 
+class RepositoryError(Exception):
+    """Custom exception for repository-related errors."""
+    pass
+
+
 class Repo:
     """Manages a ParamLake version-controlled model repository."""
+
+    @staticmethod
+    def is_repository(path: str) -> bool:
+        """
+        Check if a path contains a valid ParamLake repository.
+        
+        Args:
+            path: Path to check
+            
+        Returns:
+            True if path contains a valid repository
+        """
+        if not os.path.exists(path):
+            return False
+            
+        # Check for common ParamLake repository indicators
+        repo_indicators = [
+            # Icechunk repository files
+            ".icechunk",
+            "icechunk.json",
+            # Zarr repository files
+            ".zarray",
+            ".zgroup",
+            "zarr.json",
+            # ParamLake metadata
+            ".paramlake",
+            "paramlake.json"
+        ]
+        
+        for indicator in repo_indicators:
+            if os.path.exists(os.path.join(path, indicator)):
+                return True
+        
+        # Check if it's a zarr directory structure
+        if path.endswith('.zarr') and os.path.isdir(path):
+            return True
+            
+        return False
+
+    @staticmethod
+    def find_repository(start_path: str = ".") -> Optional[str]:
+        """
+        Find a ParamLake repository by walking up the directory tree.
+        
+        Args:
+            start_path: Directory to start searching from
+            
+        Returns:
+            Path to repository root, or None if not found
+        """
+        current_path = os.path.abspath(start_path)
+        
+        while current_path != os.path.dirname(current_path):  # Not at filesystem root
+            if Repo.is_repository(current_path):
+                return current_path
+            
+            # Check for .paramlake directory indicating repo root
+            paramlake_dir = os.path.join(current_path, ".paramlake")
+            if os.path.exists(paramlake_dir):
+                config_file = os.path.join(paramlake_dir, "config.json")
+                if os.path.exists(config_file):
+                    try:
+                        with open(config_file, 'r') as f:
+                            config = json.load(f)
+                            repo_path = config.get('repository_path')
+                            if repo_path and Repo.is_repository(repo_path):
+                                return repo_path
+                    except:
+                        pass
+                return current_path
+            
+            current_path = os.path.dirname(current_path)
+        
+        return None
+
+    @staticmethod
+    def get_repository_info(path: str) -> Dict[str, Any]:
+        """
+        Get information about a repository at the given path.
+        
+        Args:
+            path: Path to the repository
+            
+        Returns:
+            Dictionary with repository information
+        """
+        if not Repo.is_repository(path):
+            raise RepositoryError(f"No ParamLake repository found at: {path}")
+        
+        info = {
+            "path": os.path.abspath(path),
+            "exists": True,
+            "storage_type": "unknown",
+            "has_git_features": False,
+            "branches": [],
+            "tags": {},
+            "current_branch": None,
+            "last_commit": None,
+            "repository_size": 0
+        }
+        
+        try:
+            # Try to determine storage type and get basic info
+            if os.path.exists(os.path.join(path, ".icechunk")) or any(f.startswith("icechunk") for f in os.listdir(path)):
+                info["storage_type"] = "icechunk"
+                info["has_git_features"] = True
+            elif any(f.endswith('.zarr') for f in os.listdir(path)) or path.endswith('.zarr'):
+                info["storage_type"] = "zarr"
+            
+            # Calculate repository size
+            total_size = 0
+            for dirpath, dirnames, filenames in os.walk(path):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    try:
+                        total_size += os.path.getsize(filepath)
+                    except:
+                        pass
+            info["repository_size"] = total_size
+            
+            # Try to load more detailed info if possible
+            temp_config = ParamLakeConfig({"output_path": path, "storage_type": info["storage_type"]})
+            try:
+                storage_manager = create_storage_manager(temp_config)
+                
+                # Get branches
+                if hasattr(storage_manager, 'list_branches'):
+                    info["branches"] = storage_manager.list_branches()
+                
+                # Get tags
+                if hasattr(storage_manager, 'list_tags'):
+                    info["tags"] = storage_manager.list_tags()
+                
+                # Get current branch
+                if hasattr(storage_manager, 'session') and hasattr(storage_manager.session, 'branch'):
+                    info["current_branch"] = storage_manager.session.branch
+                
+                # Get recent history
+                if hasattr(storage_manager, 'get_history'):
+                    try:
+                        history = storage_manager.get_history(limit=1)
+                        if history:
+                            info["last_commit"] = history[0]
+                    except:
+                        pass
+                        
+            except Exception as e:
+                info["error"] = f"Could not load detailed repository info: {e}"
+        
+        except Exception as e:
+            info["error"] = f"Error inspecting repository: {e}"
+        
+        return info
+
+    @classmethod
+    def connect(
+        cls,
+        path: Optional[str] = None,
+        auto_find: bool = True,
+        run_id: Optional[str] = None,
+        config: Optional[Union[Dict[str, Any], ParamLakeConfig]] = None,
+        **kwargs
+    ) -> 'Repo':
+        """
+        Connect to an existing ParamLake repository.
+        
+        Args:
+            path: Path to the repository (if None, searches current directory)
+            auto_find: Whether to automatically search for repository in parent directories
+            run_id: Specific run ID to operate on
+            config: Configuration object or dictionary
+            **kwargs: Additional configuration options
+            
+        Returns:
+            Repo instance connected to the existing repository
+            
+        Raises:
+            RepositoryError: If no repository is found or connection fails
+        """
+        # Find repository path
+        if path is None:
+            if auto_find:
+                path = cls.find_repository()
+                if path is None:
+                    raise RepositoryError("No ParamLake repository found in current directory or parent directories")
+            else:
+                path = "."
+        
+        # Validate repository exists
+        if not cls.is_repository(path):
+            raise RepositoryError(f"No ParamLake repository found at: {path}")
+        
+        # Get repository info to determine connection parameters
+        repo_info = cls.get_repository_info(path)
+        
+        # Create configuration for connection
+        connect_config = {
+            "output_path": path,
+            "storage_type": repo_info.get("storage_type", "icechunk"),
+            "create_repo": False,  # Important: don't create, just connect
+            "connect_existing": True  # Flag to indicate this is a connection
+        }
+        
+        # Merge with provided config
+        if isinstance(config, dict):
+            connect_config.update(config)
+        elif isinstance(config, ParamLakeConfig):
+            connect_config.update(config.to_dict())
+        
+        connect_config.update(kwargs)
+        
+        # Create repo instance
+        try:
+            repo = cls(path=path, run_id=run_id, config=connect_config)
+            
+            # Set current branch from repository if available
+            if repo_info.get("current_branch"):
+                repo.current_branch = repo_info["current_branch"]
+            
+            print(f"✓ Connected to ParamLake repository at: {path}")
+            print(f"  Storage type: {repo_info.get('storage_type', 'unknown')}")
+            print(f"  Current branch: {repo.current_branch}")
+            if repo_info.get("branches"):
+                print(f"  Available branches: {', '.join(repo_info['branches'])}")
+            
+            return repo
+            
+        except Exception as e:
+            raise RepositoryError(f"Failed to connect to repository: {e}")
+
+    @classmethod
+    def init_or_connect(
+        cls,
+        path: str,
+        auto_connect: bool = True,
+        **kwargs
+    ) -> 'Repo':
+        """
+        Initialize a new repository or connect to existing one.
+        
+        Args:
+            path: Path for the repository
+            auto_connect: Whether to connect if repository already exists
+            **kwargs: Configuration options for initialization
+            
+        Returns:
+            Repo instance
+        """
+        if cls.is_repository(path):
+            if auto_connect:
+                print(f"Repository already exists at {path}, connecting...")
+                return cls.connect(path, auto_find=False, **kwargs)
+            else:
+                raise RepositoryError(f"Repository already exists at: {path}")
+        else:
+            print(f"Initializing new repository at {path}")
+            init_config = kwargs.copy()
+            init_config["create_repo"] = True
+            return cls(path=path, config=init_config)
 
     def __init__(
         self,
@@ -57,6 +333,12 @@ class Repo:
         if storage_type:
             self.config.config['storage_type'] = storage_type # Override if passed
 
+        # Check if connecting to existing repository
+        self.is_existing_repo = self.config.get('connect_existing', False) or self.is_repository(path)
+        
+        if self.is_existing_repo and not self.config.get('create_repo', False):
+            print(f"Opening existing repository at: {path}")
+
         self.storage_manager: StorageInterface = create_storage_manager(self.config)
         self.current_branch: Optional[str] = 'main' # Default branch
         
@@ -66,6 +348,26 @@ class Repo:
                 self.current_branch = self.storage_manager.session.branch
         except:
             pass
+
+        # Validate connection for existing repositories
+        if self.is_existing_repo:
+            self._validate_repository_connection()
+
+    def _validate_repository_connection(self) -> None:
+        """Validate that we've successfully connected to the repository."""
+        try:
+            # Test basic operations to ensure connection is working
+            if hasattr(self.storage_manager, 'list_branches'):
+                branches = self.storage_manager.list_branches()
+                if branches and self.current_branch not in branches:
+                    # Set to first available branch if current is not valid
+                    self.current_branch = branches[0]
+            
+            # Test that we can read repository status
+            self.status()
+            
+        except Exception as e:
+            print(f"Warning: Repository connection validation failed: {e}")
 
     def track(
         self,
@@ -159,33 +461,19 @@ class Repo:
         return decorator
 
     def _extract_model_parameters(self, model: Any) -> Dict[str, np.ndarray]:
-        """Helper to extract parameters from a model object."""
-        # This needs to be framework-specific. Placeholder for Keras:
-        if isinstance(model, tf.keras.Model):
-            params = {}
+        """
+        Extract model parameters in a standardized format using framework-agnostic utilities.
+        
+        Args:
+            model: The model to extract parameters from
             
-            # Create a mapping of weight objects to their layer information
-            weight_to_layer = {}
-            for layer in model.layers:
-                for weight in layer.weights:
-                    weight_to_layer[id(weight)] = layer.name
-            
-            for i, weight_var in enumerate(model.weights):
-                # Create unique name using layer name and weight name
-                layer_name = weight_to_layer.get(id(weight_var), f"layer_{i}")
-                weight_name = weight_var.name if weight_var.name else f"weight_{i}"
-                
-                # Combine layer name and weight name for uniqueness
-                unique_name = f"{layer_name}/{weight_name}"
-                
-                # Debug logging if verbose mode is enabled
-                if self.config.get("verbose", False):
-                    print(f"Extracting parameter: '{unique_name}' -> shape: {weight_var.shape}")
-                
-                params[unique_name] = weight_var.numpy()
-            return params
-        # TODO: Add support for PyTorch (model.state_dict()), etc.
-        raise NotImplementedError("Model parameter extraction not implemented for this model type.")
+        Returns:
+            Dict mapping parameter names to numpy arrays
+        """
+        try:
+            return extract_model_parameters(model)
+        except Exception as e:
+            raise ValueError(f"Failed to extract model parameters: {e}")
 
     def _resolve_reference_to_snapshot(self, reference: str) -> str:
         """Resolve a reference (branch, tag, or snapshot ID) to a snapshot ID."""
@@ -306,124 +594,12 @@ class Repo:
         parameters = self.storage_manager.load_parameters_from_snapshot(snapshot_id)
         
         if target_model_instance:
-            if isinstance(target_model_instance, tf.keras.Model):
-                if isinstance(parameters, dict):
-                    # Create mapping from weight objects to their layer information (same as in extract)
-                    weight_to_layer = {}
-                    for layer in target_model_instance.layers:
-                        for weight in layer.weights:
-                            weight_to_layer[id(weight)] = layer.name
-                    
-                    weights_to_set = []
-                    found_weights = {}
-                    
-                    # First pass: try exact name matching
-                    for i, weight_var in enumerate(target_model_instance.weights):
-                        # Recreate the unique name using the same logic as extraction
-                        layer_name = weight_to_layer.get(id(weight_var), f"layer_{i}")
-                        weight_name = weight_var.name if weight_var.name else f"weight_{i}"
-                        unique_name = f"{layer_name}/{weight_name}"
-                        
-                        # Try to find the parameter with the unique name
-                        # Also try the sanitized version for backward compatibility
-                        sanitized_name = unique_name.replace("/", "_").replace(":", "_")
-                        
-                        param_data = None
-                        matched_key = None
-                        
-                        # Try multiple matching strategies
-                        for key_to_try in [unique_name, sanitized_name, weight_var.name]:
-                            if key_to_try in parameters:
-                                param_data = parameters[key_to_try]
-                                matched_key = key_to_try
-                                break
-                        
-                        if param_data is not None:
-                            # Verify shapes match to prevent mismatch errors
-                            if param_data.shape == weight_var.shape:
-                                weights_to_set.append(param_data)
-                                found_weights[unique_name] = True
-                                if self.config.get("verbose", False):
-                                    print(f"✓ Matched '{unique_name}' -> '{matched_key}' with shape {param_data.shape}")
-                            else:
-                                print(f"Warning: Shape mismatch for {unique_name}. Expected {weight_var.shape}, got {param_data.shape}. Using existing weights.")
-                                weights_to_set.append(weight_var.numpy())
-                        else:
-                            # No exact match found, we'll handle this in the fallback
-                            weights_to_set.append(None)  # Placeholder
-                    
-                    # Second pass: positional fallback for unmatched weights
-                    has_unmatched = any(w is None for w in weights_to_set)
-                    if has_unmatched:
-                        print("Some weights not found by name, trying positional matching...")
-                        
-                        # Sort parameters to match the order they were stored in
-                        # We need to recreate the same order as in _extract_model_parameters
-                        stored_order = []
-                        for i, weight_var in enumerate(target_model_instance.weights):
-                            layer_name = weight_to_layer.get(id(weight_var), f"layer_{i}")
-                            weight_name = weight_var.name if weight_var.name else f"weight_{i}"
-                            unique_name = f"{layer_name}/{weight_name}"
-                            sanitized_name = unique_name.replace("/", "_").replace(":", "_")
-                            
-                            # Try to find this parameter in the stored parameters
-                            if unique_name in parameters:
-                                stored_order.append(parameters[unique_name])
-                            elif sanitized_name in parameters:
-                                stored_order.append(parameters[sanitized_name])
-                            elif weight_var.name in parameters:
-                                stored_order.append(parameters[weight_var.name])
-                            else:
-                                stored_order.append(None)
-                        
-                        for i, weight_var in enumerate(target_model_instance.weights):
-                            if weights_to_set[i] is None:  # This weight wasn't matched by name
-                                if i < len(stored_order) and stored_order[i] is not None:
-                                    param_data = stored_order[i]
-                                    if param_data.shape == weight_var.shape:
-                                        weights_to_set[i] = param_data
-                                        layer_name = weight_to_layer.get(id(weight_var), f"layer_{i}")
-                                        weight_name = weight_var.name if weight_var.name else f"weight_{i}"
-                                        unique_name = f"{layer_name}/{weight_name}"
-                                        found_weights[unique_name] = True
-                                        if self.config.get("verbose", False):
-                                            print(f"✓ Positionally matched '{unique_name}' at index {i} with shape {param_data.shape}")
-                                    else:
-                                        print(f"Warning: Positional shape mismatch at index {i}. Expected {weight_var.shape}, got {param_data.shape}. Using existing weights.")
-                                        weights_to_set[i] = weight_var.numpy()
-                                else:
-                                    print(f"Warning: No parameter available at position {i}, using existing weights.")
-                                    weights_to_set[i] = weight_var.numpy()
-                    
-                    if len(weights_to_set) == len(target_model_instance.weights):
-                        try:
-                            target_model_instance.set_weights(weights_to_set)
-                            print(f"✓ Successfully loaded {len(found_weights)} weights from checkpoint")
-                        except ValueError as e:
-                            print(f"Error setting weights: {e}")
-                            print("This may indicate a fundamental architecture mismatch between the saved and current model.")
-                            raise
-                    else:
-                        print("Error: Mismatch in number of weights found in checkpoint for named assignment.")
-                    
-                elif isinstance(parameters, list):
-                    # Direct list assignment - verify shapes first
-                    if len(parameters) == len(target_model_instance.weights):
-                        shape_mismatch = False
-                        for i, (param, weight_var) in enumerate(zip(parameters, target_model_instance.weights)):
-                            if param.shape != weight_var.shape:
-                                print(f"Shape mismatch at index {i}: expected {weight_var.shape}, got {param.shape}")
-                                shape_mismatch = True
-                        
-                        if not shape_mismatch:
-                            target_model_instance.set_weights(parameters)
-                        else:
-                            print("Cannot set weights due to shape mismatches. Architecture may have changed.")
-                    else:
-                        print(f"Warning: Weight count mismatch. Model has {len(target_model_instance.weights)}, checkpoint has {len(parameters)}. Cannot set weights.")
-            else:
-                raise NotImplementedError("Checkout to this model type not implemented.")
-            print(f"Loaded parameters from '{reference}' into model.")
+            try:
+                apply_parameters_to_model(target_model_instance, parameters)
+                print(f"✓ Successfully loaded parameters from '{reference}' into model.")
+            except Exception as e:
+                print(f"Error applying parameters to model: {e}")
+                raise
         
         # Update current branch if checking out a branch
         try:
@@ -828,3 +1004,655 @@ class Repo:
         """
         
         return html 
+
+    def _extract_layer_parameters(self, model: Any, layer_names: List[str]) -> Dict[str, np.ndarray]:
+        """Extract parameters from specific layers only."""
+        if isinstance(model, tf.keras.Model):
+            params = {}
+            
+            # Create a mapping of weight objects to their layer information
+            weight_to_layer = {}
+            for layer in model.layers:
+                if layer.name in layer_names:  # Only process specified layers
+                    for weight in layer.weights:
+                        weight_to_layer[id(weight)] = layer.name
+            
+            for i, weight_var in enumerate(model.weights):
+                # Check if this weight belongs to one of the target layers
+                layer_name = weight_to_layer.get(id(weight_var))
+                if layer_name is not None:  # Only include weights from target layers
+                    weight_name = weight_var.name if weight_var.name else f"weight_{i}"
+                    
+                    # Combine layer name and weight name for uniqueness
+                    unique_name = f"{layer_name}/{weight_name}"
+                    
+                    # Debug logging if verbose mode is enabled
+                    if self.config.get("verbose", False):
+                        print(f"Extracting layer parameter: '{unique_name}' -> shape: {weight_var.shape}")
+                    
+                    params[unique_name] = weight_var.numpy()
+            return params
+        # TODO: Add support for PyTorch (model.state_dict()), etc.
+        raise NotImplementedError("Layer parameter extraction not implemented for this model type.")
+
+    def _get_model_layer_names(self, model: Any) -> List[str]:
+        """Get all layer names from a model."""
+        if isinstance(model, tf.keras.Model):
+            return [layer.name for layer in model.layers]
+        raise NotImplementedError("Layer name extraction not implemented for this model type.")
+
+    def commit_layer(
+        self,
+        model: Any,
+        layer_names: Union[str, List[str]],
+        message: str,
+        branch: Optional[str] = None,
+        author: Optional[str] = None,
+        additional_metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Commit only specific layers to the repository.
+        
+        Args:
+            model: Model containing the layers to commit
+            layer_names: Name(s) of layers to commit (string or list)
+            message: Commit message
+            branch: Target branch (defaults to current)
+            author: Author name
+            additional_metadata: Additional metadata
+            
+        Returns:
+            Snapshot ID
+        """
+        if not hasattr(self.storage_manager, 'commit_model_state'):
+            raise NotImplementedError("The configured storage manager does not support layer commits.")
+        
+        # Normalize layer_names to list
+        if isinstance(layer_names, str):
+            layer_names = [layer_names]
+        
+        # Validate that all specified layers exist
+        available_layers = self._get_model_layer_names(model)
+        missing_layers = [name for name in layer_names if name not in available_layers]
+        if missing_layers:
+            raise ValueError(f"Layers not found in model: {missing_layers}")
+        
+        # Extract only the specified layers' parameters
+        layer_params = self._extract_layer_parameters(model, layer_names)
+        
+        target_branch = branch if branch is not None else self.current_branch
+        if target_branch is None:
+            target_branch = 'main'
+
+        # Add layer information to metadata
+        if additional_metadata is None:
+            additional_metadata = {}
+        additional_metadata.update({
+            'commit_type': 'layer_commit',
+            'committed_layers': layer_names,
+            'layer_count': len(layer_names)
+        })
+
+        snapshot_id = self.storage_manager.commit_model_state(
+            model_parameters=layer_params,
+            message=message,
+            branch_name=target_branch,
+            author=author,
+            additional_metadata=additional_metadata
+        )
+        
+        layers_str = ', '.join(layer_names)
+        print(f"Committed layers [{layers_str}] to branch '{target_branch}' - Snapshot ID: {snapshot_id}")
+        return snapshot_id
+
+    def checkout_layer(
+        self,
+        reference: str,
+        layer_names: Union[str, List[str]],
+        target_model_instance: Any,
+        strategy: str = 'replace'
+    ) -> None:
+        """
+        Checkout specific layers from a reference and apply them to a model.
+        
+        Args:
+            reference: Snapshot ID, branch, or tag to checkout from
+            layer_names: Name(s) of layers to checkout (string or list)
+            target_model_instance: Model to apply the layers to
+            strategy: How to handle the checkout ('replace', 'merge')
+        """
+        if not hasattr(self.storage_manager, 'load_parameters_from_snapshot'):
+            raise NotImplementedError("Storage manager does not support loading parameters from snapshots.")
+        
+        # Normalize layer_names to list
+        if isinstance(layer_names, str):
+            layer_names = [layer_names]
+        
+        # Resolve reference to snapshot ID
+        snapshot_id = self._resolve_reference_to_snapshot(reference)
+        all_parameters = self.storage_manager.load_parameters_from_snapshot(snapshot_id)
+        
+        # Filter parameters to only include the specified layers
+        layer_parameters = {}
+        for param_name, param_data in all_parameters.items():
+            # Check if this parameter belongs to one of the target layers
+            for layer_name in layer_names:
+                if param_name.startswith(f"{layer_name}/"):
+                    layer_parameters[param_name] = param_data
+                    break
+        
+        if not layer_parameters:
+            print(f"Warning: No parameters found for layers {layer_names} in snapshot {snapshot_id}")
+            return
+        
+        # Apply the layer parameters to the model
+        if isinstance(target_model_instance, tf.keras.Model):
+            self._apply_layer_parameters_to_model(
+                target_model_instance, 
+                layer_parameters, 
+                layer_names,
+                strategy
+            )
+        else:
+            raise NotImplementedError("Layer checkout not implemented for this model type.")
+        
+        layers_str = ', '.join(layer_names)
+        print(f"✓ Checked out layers [{layers_str}] from '{reference}' using strategy '{strategy}'")
+
+    def _apply_layer_parameters_to_model(
+        self,
+        model: Any,
+        layer_parameters: Dict[str, np.ndarray],
+        target_layer_names: List[str],
+        strategy: str
+    ) -> None:
+        """Apply layer parameters to specific layers in a model."""
+        if strategy not in ['replace', 'merge']:
+            raise ValueError(f"Unknown strategy: {strategy}. Use 'replace' or 'merge'.")
+        
+        # Create mapping from weight objects to their layer information
+        weight_to_layer = {}
+        layer_weights = {}  # Track weights by layer
+        
+        for layer in model.layers:
+            if layer.name in target_layer_names:
+                layer_weights[layer.name] = []
+                for weight in layer.weights:
+                    weight_to_layer[id(weight)] = layer.name
+                    layer_weights[layer.name].append(weight)
+        
+        # Build new weights list
+        new_weights = []
+        weights_updated = 0
+        
+        for i, weight_var in enumerate(model.weights):
+            layer_name = weight_to_layer.get(id(weight_var))
+            
+            if layer_name in target_layer_names:
+                # This weight belongs to a target layer
+                weight_name = weight_var.name if weight_var.name else f"weight_{i}"
+                unique_name = f"{layer_name}/{weight_name}"
+                sanitized_name = unique_name.replace("/", "_").replace(":", "_")
+                
+                # Try to find the parameter
+                param_data = None
+                for key_to_try in [unique_name, sanitized_name, weight_var.name]:
+                    if key_to_try in layer_parameters:
+                        param_data = layer_parameters[key_to_try]
+                        break
+                
+                if param_data is not None and param_data.shape == weight_var.shape:
+                    new_weights.append(param_data)
+                    weights_updated += 1
+                    if self.config.get("verbose", False):
+                        print(f"✓ Updated {unique_name} with shape {param_data.shape}")
+                else:
+                    if strategy == 'replace':
+                        print(f"Warning: Could not find matching parameter for {unique_name}, keeping existing")
+                    new_weights.append(weight_var.numpy())
+            else:
+                # This weight is not in a target layer, keep existing
+                new_weights.append(weight_var.numpy())
+        
+        # Apply the new weights
+        try:
+            model.set_weights(new_weights)
+            print(f"✓ Successfully updated {weights_updated} weights in {len(target_layer_names)} layers")
+        except ValueError as e:
+            print(f"Error applying layer parameters: {e}")
+            raise
+
+    def list_layers(self, reference: Optional[str] = None) -> List[str]:
+        """
+        List all layers available in a specific reference.
+        
+        Args:
+            reference: Snapshot ID, branch, or tag (defaults to current HEAD)
+            
+        Returns:
+            List of layer names
+        """
+        if reference is None:
+            reference = self.current_branch or 'main'
+        
+        try:
+            # Use the analyzer to get layer information
+            analyzer = self.get_analyzer()
+            if reference != self.current_branch:
+                analyzer = analyzer.checkout_analyzer(reference)
+            
+            return analyzer.get_layer_names()
+        except:
+            # Fallback: try to extract from parameters
+            snapshot_id = self._resolve_reference_to_snapshot(reference)
+            parameters = self.storage_manager.load_parameters_from_snapshot(snapshot_id)
+            
+            # Extract unique layer names from parameter keys
+            layer_names = set()
+            for param_name in parameters.keys():
+                if '/' in param_name:
+                    layer_name = param_name.split('/')[0]
+                    layer_names.add(layer_name)
+            
+            return sorted(list(layer_names))
+
+    def diff_layer(
+        self,
+        layer_names: Union[str, List[str]],
+        ref1: str,
+        ref2: Optional[str] = None,
+        include_values: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Show differences for specific layers between two references.
+        
+        Args:
+            layer_names: Name(s) of layers to compare (string or list)
+            ref1: First reference to compare
+            ref2: Second reference (defaults to current HEAD)
+            include_values: Whether to include actual tensor values in comparison
+            
+        Returns:
+            Dictionary with layer-specific differences
+        """
+        # Normalize layer_names to list
+        if isinstance(layer_names, str):
+            layer_names = [layer_names]
+        
+        if ref2 is None:
+            ref2 = self.current_branch or 'main'
+        
+        # Get analyzers for both references
+        analyzer1 = self.get_analyzer()
+        analyzer1 = analyzer1.checkout_analyzer(ref1)
+        
+        analyzer2 = self.get_analyzer()
+        if ref2 != ref1:
+            analyzer2 = analyzer2.checkout_analyzer(ref2)
+        
+        layer_diff = {
+            "ref1": ref1,
+            "ref2": ref2,
+            "layers": {},
+            "summary": {
+                "layers_compared": len(layer_names),
+                "layers_changed": 0,
+                "layers_missing": []
+            }
+        }
+        
+        for layer_name in layer_names:
+            try:
+                # Get layer info from both snapshots
+                info1 = analyzer1.get_layer_info(layer_name)
+                info2 = analyzer2.get_layer_info(layer_name)
+                
+                # Compare the layer
+                layer_comparison = self._compare_layer_info(info1, info2, layer_name, include_values, analyzer1, analyzer2)
+                
+                if layer_comparison.get('has_changes', False):
+                    layer_diff["summary"]["layers_changed"] += 1
+                
+                layer_diff["layers"][layer_name] = layer_comparison
+                
+            except Exception as e:
+                layer_diff["layers"][layer_name] = {"error": str(e)}
+                layer_diff["summary"]["layers_missing"].append(layer_name)
+        
+        return layer_diff
+
+    def _compare_layer_info(
+        self,
+        info1: Dict[str, Any],
+        info2: Dict[str, Any],
+        layer_name: str,
+        include_values: bool,
+        analyzer1,
+        analyzer2
+    ) -> Dict[str, Any]:
+        """Compare layer information between two snapshots."""
+        comparison = {
+            "has_changes": False,
+            "attribute_changes": {},
+            "tensor_changes": {}
+        }
+        
+        # Compare attributes
+        attrs1 = {k: v for k, v in info1.items() if k not in ['tensor_types', 'tensors']}
+        attrs2 = {k: v for k, v in info2.items() if k not in ['tensor_types', 'tensors']}
+        
+        for key in set(attrs1.keys()) | set(attrs2.keys()):
+            if attrs1.get(key) != attrs2.get(key):
+                comparison["attribute_changes"][key] = {
+                    "old": attrs1.get(key),
+                    "new": attrs2.get(key)
+                }
+                comparison["has_changes"] = True
+        
+        # Compare tensors
+        tensors1 = info1.get('tensors', {})
+        tensors2 = info2.get('tensors', {})
+        
+        for tensor_type in set(tensors1.keys()) | set(tensors2.keys()):
+            type_diff = {}
+            
+            t1_names = set(tensors1.get(tensor_type, []))
+            t2_names = set(tensors2.get(tensor_type, []))
+            
+            # Check for added/removed tensors
+            for name in t1_names - t2_names:
+                type_diff[name] = {"status": "removed"}
+                comparison["has_changes"] = True
+                
+            for name in t2_names - t1_names:
+                type_diff[name] = {"status": "added"}
+                comparison["has_changes"] = True
+            
+            # Check for modified tensors
+            for name in t1_names & t2_names:
+                if include_values:
+                    try:
+                        # Compare actual tensor data
+                        data1 = analyzer1.get_tensor_data(layer_name, tensor_type, name)
+                        data2 = analyzer2.get_tensor_data(layer_name, tensor_type, name)
+                        
+                        if data1.shape != data2.shape:
+                            type_diff[name] = {
+                                "shape_changed": True,
+                                "old_shape": data1.shape,
+                                "new_shape": data2.shape
+                            }
+                            comparison["has_changes"] = True
+                        elif not np.array_equal(data1, data2):
+                            # Calculate difference statistics
+                            diff = np.abs(data2 - data1)
+                            type_diff[name] = {
+                                "values_changed": True,
+                                "max_diff": float(np.max(diff)),
+                                "mean_diff": float(np.mean(diff)),
+                                "norm_diff": float(np.linalg.norm(diff))
+                            }
+                            comparison["has_changes"] = True
+                    except Exception as e:
+                        type_diff[name] = {"error": f"Could not compare values: {e}"}
+            
+            if type_diff:
+                comparison["tensor_changes"][tensor_type] = type_diff
+        
+        return comparison
+
+    def merge_layer(
+        self,
+        layer_names: Union[str, List[str]],
+        source_branch: str,
+        strategy: str = 'auto',
+        commit_message: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Merge specific layers from source branch into current branch.
+        
+        Args:
+            layer_names: Name(s) of layers to merge (string or list)
+            source_branch: Branch to merge layers from
+            strategy: Merge strategy ('auto', 'ours', 'theirs')
+            commit_message: Custom commit message
+            
+        Returns:
+            Snapshot ID if successful, None otherwise
+        """
+        # Normalize layer_names to list
+        if isinstance(layer_names, str):
+            layer_names = [layer_names]
+        
+        target_branch = self.current_branch or 'main'
+        
+        if source_branch == target_branch:
+            print("Cannot merge layer from the same branch")
+            return None
+        
+        print(f"Merging layers [{', '.join(layer_names)}] from '{source_branch}' into '{target_branch}'")
+        
+        try:
+            # Get current model state (this would typically come from the calling context)
+            # For now, we'll work with the storage manager directly
+            
+            # Get layer parameters from source branch
+            source_snapshot = self._resolve_reference_to_snapshot(source_branch)
+            source_params = self.storage_manager.load_parameters_from_snapshot(source_snapshot)
+            
+            # Filter to only the specified layers
+            layer_params = {}
+            for param_name, param_data in source_params.items():
+                for layer_name in layer_names:
+                    if param_name.startswith(f"{layer_name}/"):
+                        layer_params[param_name] = param_data
+                        break
+            
+            if not layer_params:
+                print(f"No parameters found for layers {layer_names} in source branch")
+                return None
+            
+            # Create commit message
+            if not commit_message:
+                layers_str = ', '.join(layer_names)
+                commit_message = f"Merge layers [{layers_str}] from branch '{source_branch}'"
+            
+            # Commit the layer parameters
+            snapshot_id = self.storage_manager.commit_model_state(
+                model_parameters=layer_params,
+                message=commit_message,
+                branch_name=target_branch,
+                additional_metadata={
+                    'merge_type': 'layer_merge',
+                    'source_branch': source_branch,
+                    'merged_layers': layer_names,
+                    'strategy': strategy
+                }
+            )
+            
+            layers_str = ', '.join(layer_names)
+            print(f"✓ Merged layers [{layers_str}] from '{source_branch}' - Snapshot ID: {snapshot_id}")
+            return snapshot_id
+            
+        except Exception as e:
+            print(f"Error merging layers: {e}")
+            return None
+
+    def layer_status(self, layer_names: Optional[Union[str, List[str]]] = None) -> Dict[str, Any]:
+        """
+        Show status of specific layers or all layers.
+        
+        Args:
+            layer_names: Name(s) of layers to check (None for all layers)
+            
+        Returns:
+            Dictionary with layer status information
+        """
+        try:
+            analyzer = self.get_analyzer()
+            all_layers = analyzer.get_layer_names()
+            
+            if layer_names is None:
+                target_layers = all_layers
+            else:
+                if isinstance(layer_names, str):
+                    target_layers = [layer_names]
+                else:
+                    target_layers = layer_names
+            
+            status = {
+                "branch": self.current_branch,
+                "total_layers": len(all_layers),
+                "checked_layers": len(target_layers),
+                "layers": {}
+            }
+            
+            for layer_name in target_layers:
+                if layer_name not in all_layers:
+                    status["layers"][layer_name] = {"status": "not_found"}
+                    continue
+                
+                try:
+                    layer_info = analyzer.get_layer_info(layer_name)
+                    
+                    layer_status = {
+                        "status": "available",
+                        "tensor_types": layer_info.get("tensor_types", []),
+                        "tensor_count": sum(len(tensors) for tensors in layer_info.get("tensors", {}).values()),
+                        "has_weights": "weights" in layer_info.get("tensor_types", []),
+                        "has_gradients": "gradients" in layer_info.get("tensor_types", []),
+                    }
+                    
+                    # Add additional metadata if available
+                    for key in ["type", "has_gradients"]:
+                        if key in layer_info:
+                            layer_status[key] = layer_info[key]
+                    
+                    status["layers"][layer_name] = layer_status
+                    
+                except Exception as e:
+                    status["layers"][layer_name] = {
+                        "status": "error",
+                        "error": str(e)
+                    }
+            
+            return status
+            
+        except Exception as e:
+            return {"error": f"Could not get layer status: {e}"}
+
+    def rebase_layer(
+        self,
+        layer_names: Union[str, List[str]],
+        source_branch: str,
+        target_branch: Optional[str] = None,
+        conflict_strategy: str = 'detect'
+    ) -> str:
+        """
+        Rebase specific layers from one branch onto another.
+        
+        Args:
+            layer_names: Name(s) of layers to rebase (string or list)
+            source_branch: Branch containing the layers to rebase
+            target_branch: Branch to rebase onto (defaults to current)
+            conflict_strategy: How to handle conflicts ('detect', 'ours', 'theirs')
+            
+        Returns:
+            Snapshot ID of the rebase result
+        """
+        # Normalize layer_names to list
+        if isinstance(layer_names, str):
+            layer_names = [layer_names]
+        
+        if target_branch is None:
+            target_branch = self.current_branch or 'main'
+        
+        print(f"Rebasing layers [{', '.join(layer_names)}] from '{source_branch}' onto '{target_branch}'")
+        
+        try:
+            # Get layer parameters from source branch
+            source_snapshot = self._resolve_reference_to_snapshot(source_branch)
+            source_params = self.storage_manager.load_parameters_from_snapshot(source_snapshot)
+            
+            # Get layer parameters from target branch
+            target_snapshot = self._resolve_reference_to_snapshot(target_branch)
+            target_params = self.storage_manager.load_parameters_from_snapshot(target_snapshot)
+            
+            # Extract only the specified layers from source
+            layer_params = {}
+            for param_name, param_data in source_params.items():
+                for layer_name in layer_names:
+                    if param_name.startswith(f"{layer_name}/"):
+                        layer_params[param_name] = param_data
+                        break
+            
+            if not layer_params:
+                raise ValueError(f"No parameters found for layers {layer_names} in source branch")
+            
+            # Handle conflicts if any
+            conflicts = []
+            for param_name in layer_params:
+                if param_name in target_params:
+                    if not np.array_equal(layer_params[param_name], target_params[param_name]):
+                        conflicts.append(param_name)
+            
+            if conflicts and conflict_strategy == 'detect':
+                raise ValueError(f"Conflicts detected in parameters: {conflicts}")
+            elif conflicts and conflict_strategy == 'theirs':
+                # Keep target branch version for conflicts
+                for param_name in conflicts:
+                    layer_params[param_name] = target_params[param_name]
+            # For 'ours' strategy, we keep the source version (default behavior)
+            
+            # Commit the rebased layers
+            message = f"Rebase layers [{', '.join(layer_names)}] from '{source_branch}' onto '{target_branch}'"
+            
+            snapshot_id = self.storage_manager.commit_model_state(
+                model_parameters=layer_params,
+                message=message,
+                branch_name=target_branch,
+                additional_metadata={
+                    'rebase_type': 'layer_rebase',
+                    'source_branch': source_branch,
+                    'rebased_layers': layer_names,
+                    'conflict_strategy': conflict_strategy,
+                    'conflicts_resolved': len(conflicts)
+                }
+            )
+            
+            layers_str = ', '.join(layer_names)
+            print(f"✓ Rebased layers [{layers_str}] - Snapshot ID: {snapshot_id}")
+            if conflicts:
+                print(f"✓ Resolved {len(conflicts)} conflicts using strategy '{conflict_strategy}'")
+            
+            return snapshot_id
+            
+        except Exception as e:
+            print(f"Error rebasing layers: {e}")
+            raise
+
+    def reset_layer(
+        self,
+        layer_names: Union[str, List[str]],
+        to_reference: str,
+        target_model_instance: Any
+    ) -> None:
+        """
+        Reset specific layers to a previous state.
+        
+        Args:
+            layer_names: Name(s) of layers to reset (string or list)
+            to_reference: Reference to reset to (snapshot ID, branch, or tag)
+            target_model_instance: Model to apply the reset layers to
+        """
+        # Normalize layer_names to list
+        if isinstance(layer_names, str):
+            layer_names = [layer_names]
+        
+        print(f"Resetting layers [{', '.join(layer_names)}] to '{to_reference}'")
+        
+        # This is essentially the same as checkout_layer with replace strategy
+        self.checkout_layer(to_reference, layer_names, target_model_instance, strategy='replace')
+        
+        layers_str = ', '.join(layer_names)
+        print(f"✓ Reset layers [{layers_str}] to '{to_reference}'") 

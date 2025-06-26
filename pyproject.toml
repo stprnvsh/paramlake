@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "paramlake"
 version = "0.1.1"
-description = "A comprehensive parameter tracking and storage system for TensorFlow models using Zarr"
+description = "A comprehensive parameter tracking and storage system for machine learning models using Zarr"
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
@@ -13,8 +13,8 @@ license-files = ["LICENSE"]
 authors = [
     {name = "Pranav Sateesh", email = "pranav.sateesh99@gmail.com"}
 ]
+# Core dependencies - framework agnostic
 dependencies = [
-    "tensorflow>=2.6.0",
     "zarr>=2.12.0",
     "numcodecs>=0.10.0",
     "pyyaml>=6.0",
@@ -27,15 +27,86 @@ Homepage = "https://github.com/stprnvsh/paramlake"
 Repository = "https://github.com/stprnvsh/paramlake"
 
 [project.optional-dependencies]
+# Development dependencies
 dev = [
     "pytest>=7.0.0",
     "black>=22.0.0",
     "isort>=5.10.0",
     "mypy>=0.950",
 ]
+
+# Visualization dependencies
 visualize = [
     "matplotlib>=3.5.0",
     "seaborn>=0.11.0",
+]
+
+# ML Framework specific dependencies
+tf = [
+    "tensorflow>=2.6.0",
+]
+
+torch = [
+    "torch>=1.8.0",
+    "torchvision>=0.9.0",
+]
+
+jax = [
+    "jax[cpu]>=0.3.0",
+    "jaxlib>=0.3.0",
+    "flax>=0.6.0",
+]
+
+# HuggingFace ecosystem
+hf = [
+    "transformers>=4.20.0",
+    "datasets>=2.0.0",
+    "tokenizers>=0.12.0",
+]
+
+# Scientific computing
+scientific = [
+    "scipy>=1.7.0",
+    "scikit-learn>=1.0.0",
+]
+
+# Distributed computing
+distributed = [
+    "dask[array]>=2022.0.0",
+    "xarray>=0.19.0",
+]
+
+# All ML frameworks combined
+all-ml = [
+    "tensorflow>=2.6.0",
+    "torch>=1.8.0", 
+    "torchvision>=0.9.0",
+    "jax[cpu]>=0.3.0",
+    "jaxlib>=0.3.0",
+    "flax>=0.6.0",
+]
+
+# Everything including development tools
+all = [
+    "tensorflow>=2.6.0",
+    "torch>=1.8.0",
+    "torchvision>=0.9.0", 
+    "jax[cpu]>=0.3.0",
+    "jaxlib>=0.3.0",
+    "flax>=0.6.0",
+    "transformers>=4.20.0",
+    "datasets>=2.0.0",
+    "tokenizers>=0.12.0",
+    "scipy>=1.7.0",
+    "scikit-learn>=1.0.0",
+    "dask[array]>=2022.0.0",
+    "xarray>=0.19.0",
+    "matplotlib>=3.5.0",
+    "seaborn>=0.11.0",
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "isort>=5.10.0",
+    "mypy>=0.950",
 ]
 
 [tool.setuptools]

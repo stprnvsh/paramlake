@@ -145,9 +145,12 @@ class IcechunkStorageManager(StorageInterface):
         # Set up branch/tag handling
         self.run_id = config.get("run_id")
         
+        # Track current branch - IMPORTANT: This fixes the read-only session issue
+        self.current_branch = "main"
+        
         # Create session for writing
         try:
-            self.session = self.repo.writable_session("main")
+            self.session = self.repo.writable_session(self.current_branch)
             self.store = self.session.store
         except Exception as e:
             print(f"Error creating writable session: {e}. Creating 'main' branch first.")
@@ -155,12 +158,12 @@ class IcechunkStorageManager(StorageInterface):
             try:
                 init_snapshot = self.repo.initial_snapshot()
                 self.repo.create_branch("main", snapshot_id=init_snapshot.id)
-                self.session = self.repo.writable_session("main")
+                self.session = self.repo.writable_session(self.current_branch)
                 self.store = self.session.store
             except Exception as e2:
                 # Branch might already exist, try again
                 try:
-                    self.session = self.repo.writable_session("main")
+                    self.session = self.repo.writable_session(self.current_branch)
                     self.store = self.session.store
                 except Exception as e3:
                     raise RuntimeError(f"Failed to create session: {e3}")
@@ -199,6 +202,9 @@ class IcechunkStorageManager(StorageInterface):
         self.auto_tag_enabled = False  
         self.auto_tag_frequency = 50
         self.auto_tag_prefix = "v"
+        
+        # Track if we have pending changes to avoid unnecessary commits
+        self.has_pending_changes = False
 
     def _initialize_zarr_groups(self):
         """Initialize the basic zarr group structure needed for ParamLake."""
@@ -234,7 +240,7 @@ class IcechunkStorageManager(StorageInterface):
         
     def _initialize_run_metadata(self) -> None:
         """Initialize metadata for the current run."""
-        import tensorflow as tf
+        from paramlake.utils.framework_utils import HAS_TENSORFLOW
         from datetime import datetime
         
         # Check if metadata already exists
@@ -243,8 +249,16 @@ class IcechunkStorageManager(StorageInterface):
             
         # Store basic metadata
         self.root_group.attrs["paramlake_version"] = "0.1.0"
-        self.root_group.attrs["framework"] = "tensorflow"
-        self.root_group.attrs["framework_version"] = tf.__version__
+        
+        # Only set framework info if TensorFlow is available
+        if HAS_TENSORFLOW:
+            import tensorflow as tf
+            self.root_group.attrs["framework"] = "tensorflow"
+            self.root_group.attrs["framework_version"] = tf.__version__
+        else:
+            self.root_group.attrs["framework"] = "unknown"
+            self.root_group.attrs["framework_version"] = "N/A"
+            
         self.root_group.attrs["timestamp"] = datetime.now().isoformat()
         self.root_group.attrs["current_step"] = 0
         
@@ -290,6 +304,7 @@ class IcechunkStorageManager(StorageInterface):
     ) -> None:
         """
         Store a tensor in the Icechunk store.
+        FIXED: Better session management and change tracking.
         
         Args:
             layer_group: Layer group
@@ -305,6 +320,7 @@ class IcechunkStorageManager(StorageInterface):
             # Create path for tensor
             if tensor_type not in layer_group:
                 tensor_group = layer_group.create_group(tensor_type)
+                self.has_pending_changes = True
             else:
                 tensor_group = layer_group[tensor_type]
             
@@ -331,6 +347,7 @@ class IcechunkStorageManager(StorageInterface):
                         try:
                             new_shape = (current_step + 10,) + tensor_data.shape
                             array.resize(new_shape)
+                            self.has_pending_changes = True
                         except Exception:
                             # Resize failed, need to recreate
                             create_new_array = True
@@ -356,7 +373,14 @@ class IcechunkStorageManager(StorageInterface):
                             del tensor_group[tensor_name]
                         except Exception:
                             # This might fail after a commit when store is read-only
-                            pass
+                            print(f"Could not delete existing array {tensor_name}, refreshing session...")
+                            self._refresh_session_after_commit()
+                            # Get fresh references after session refresh
+                            layer_group = self.layers_group[layer_group.name.split('/')[-1]]
+                            if tensor_type not in layer_group:
+                                tensor_group = layer_group.create_group(tensor_type)
+                            else:
+                                tensor_group = layer_group[tensor_type]
                             
                     # Create new array
                     array = tensor_group.create_dataset(
@@ -366,6 +390,8 @@ class IcechunkStorageManager(StorageInterface):
                         dtype=tensor_data.dtype,
                         fill_value=0  # Use fill value for uninitialized data
                     )
+                    
+                    self.has_pending_changes = True
                     
                     # Store shape information for future reference
                     self.tensor_shapes[tensor_key] = {
@@ -410,6 +436,8 @@ class IcechunkStorageManager(StorageInterface):
                             fill_value=0
                         )
                         
+                        self.has_pending_changes = True
+                        
                         # Add gradient metadata if applicable
                         if tensor_type == "gradients":
                             array.attrs["first_gradient_step"] = current_step
@@ -431,6 +459,7 @@ class IcechunkStorageManager(StorageInterface):
                         
                     # Store tensor data at the appropriate step
                     array[current_step] = tensor_data
+                    self.has_pending_changes = True
                     
                     # For gradients, verify the write was successful
                     if tensor_type == "gradients" and self.config.get("verbose", False):
@@ -460,11 +489,29 @@ class IcechunkStorageManager(StorageInterface):
                                 pass
                             
                 except Exception as e:
-                    print(f"Error writing data to array {tensor_name}: {e}")
-                    if self.config.get("verbose", False):
-                        print(f"Array shape: {array.shape if array else 'None'}")
-                        print(f"Data shape: {tensor_data.shape}")
-                        print(f"Current step: {current_step}")
+                    error_msg = str(e).lower()
+                    if "read-only" in error_msg or "cannot write" in error_msg:
+                        print(f"Session became read-only, refreshing and retrying write for {tensor_name}")
+                        try:
+                            self._refresh_session_after_commit()
+                            # Get fresh references and retry
+                            layer_group = self.layers_group[layer_group.name.split('/')[-1]]
+                            tensor_group = layer_group[tensor_type]
+                            array = tensor_group[tensor_name]
+                            if current_step < array.shape[0] and array.shape[1:] == tensor_data.shape:
+                                array[current_step] = tensor_data
+                                self.has_pending_changes = True
+                                print(f"Successfully wrote {tensor_name} after session refresh")
+                            else:
+                                print(f"Still cannot write {tensor_name} after session refresh")
+                        except Exception as e_retry:
+                            print(f"Failed to write {tensor_name} even after session refresh: {e_retry}")
+                    else:
+                        print(f"Error writing data to array {tensor_name}: {e}")
+                        if self.config.get("verbose", False):
+                            print(f"Array shape: {array.shape if array else 'None'}")
+                            print(f"Data shape: {tensor_data.shape}")
+                            print(f"Current step: {current_step}")
             else:
                 if array is None:
                     print(f"Error: Array {tensor_name} is None")
@@ -729,12 +776,13 @@ class IcechunkStorageManager(StorageInterface):
     def commit_changes(self, message=None):
         """
         Commit the current transaction to create a new snapshot.
+        FIXED: Better handling of read-only sessions and empty commits.
         
         Args:
             message: Commit message
             
         Returns:
-            Snapshot ID
+            Snapshot ID or None if no changes to commit
         """
         # Use the current step from the storage manager
         step_to_commit = self.current_step
@@ -742,11 +790,17 @@ class IcechunkStorageManager(StorageInterface):
         if not message:
             # Use the actual 1-indexed epoch number in the message
             message = f"Update at epoch {step_to_commit}"
-        # Don't modify the epoch number in the commit message anymore as it's already correct
         
         if self.config.get("icechunk", {}).get("verbose", False):
             print(f"Committing changes with message: '{message}'")
             print(f"Current step: {step_to_commit}")
+            print(f"Current branch: {self.current_branch}")
+        
+        # Check if we have any pending changes before attempting commit
+        if not self.has_pending_changes:
+            if self.config.get("verbose", False):
+                print("No pending changes to commit")
+            return None
         
         # Commit the current session
         try:
@@ -780,34 +834,66 @@ class IcechunkStorageManager(StorageInterface):
                         print(f"Warning: Could not create tag {tag_name}: {e}")
                 
             return snapshot_id
+            
         except Exception as e:
-            print(f"Error committing changes for step {step_to_commit}: {e}")
-            # Try to reopen the session
-            try:
-                self._refresh_session_after_commit()
+            error_msg = str(e).lower()
+            # Handle the "no changes made" error gracefully
+            if "no changes made" in error_msg or "cannot commit" in error_msg:
+                if self.config.get("verbose", False):
+                    print(f"No changes to commit at step {step_to_commit}")
+                # Still refresh the session to ensure we can continue
+                try:
+                    self._refresh_session_after_commit()
+                except:
+                    pass
                 return None
-            except Exception as e:
-                print(f"Error reopening session: {e}")
-                return None
+            else:
+                print(f"Error committing changes for step {step_to_commit}: {e}")
+                # Try to refresh the session to recover
+                try:
+                    self._refresh_session_after_commit()
+                    return None
+                except Exception as e2:
+                    print(f"Error refreshing session after commit failure: {e2}")
+                    return None
     
     def _refresh_session_after_commit(self):
         """
         Refresh the session after a commit to ensure we can continue writing.
         This is necessary because Icechunk creates a read-only view after commit.
+        FIXED: Now properly tracks and switches back to the current branch.
         """
         try:
-            # Don't try to close the session - Icechunk Session objects don't have a close method
-            
-            # Create a new session
-            self.session = self.repo.writable_session("main")
+            # Create a new writable session on the current branch
+            old_branch = self.current_branch
+            self.session = self.repo.writable_session(self.current_branch)
             self.store = self.session.store
             
             # Reinitialize Zarr groups with the new store
             self._initialize_zarr_groups()
             
-            print("Successfully refreshed session after commit")
+            # Reset pending changes flag
+            self.has_pending_changes = False
+            
+            if self.config.get("verbose", False):
+                print(f"Successfully refreshed session on branch '{self.current_branch}'")
         except Exception as e:
-            print(f"Error refreshing session: {e}")
+            print(f"Error refreshing session on branch '{self.current_branch}': {e}")
+            # Try to fallback to main branch if current branch fails
+            if self.current_branch != "main":
+                try:
+                    print(f"Falling back to main branch...")
+                    self.current_branch = "main"
+                    self.session = self.repo.writable_session("main")
+                    self.store = self.session.store
+                    self._initialize_zarr_groups()
+                    self.has_pending_changes = False
+                    print("Successfully refreshed session on main branch")
+                except Exception as e2:
+                    print(f"Failed to refresh session even on main branch: {e2}")
+                    raise
+            else:
+                raise
     
     def close(self) -> None:
         """Close the storage manager."""
@@ -2524,6 +2610,7 @@ class IcechunkStorageManager(StorageInterface):
     def commit_if_needed(self, step: int, force: bool = False, message: Optional[str] = None) -> Optional[str]:
         """
         Centralized commit logic that coordinates automatic commits from different sources.
+        FIXED: Better handling of empty commits and read-only sessions.
         
         Args:
             step: Current step/epoch (0-based)
@@ -2546,6 +2633,12 @@ class IcechunkStorageManager(StorageInterface):
             if not message:
                 message = f"Auto-commit at epoch {epoch_num}"
             
+            # Only commit if we have pending changes
+            if not force and not self.has_pending_changes:
+                if self.config.get("verbose", False):
+                    print(f"No pending changes at epoch {epoch_num}, skipping commit")
+                return None
+                
             snapshot_id = self.commit_changes(message)
             
             if snapshot_id:
@@ -2567,3 +2660,51 @@ class IcechunkStorageManager(StorageInterface):
                 return snapshot_id
         
         return None
+
+    def switch_to_branch(self, branch_name: str, create_if_missing: bool = True):
+        """
+        Switch to a specific branch for all subsequent operations.
+        FIXED: Properly manages session switching between branches.
+        
+        Args:
+            branch_name: Name of the branch to switch to
+            create_if_missing: Whether to create the branch if it doesn't exist
+        """
+        try:
+            # Check if branch exists
+            existing_branches = list(self.repo.list_branches())
+            
+            if branch_name not in existing_branches:
+                if create_if_missing:
+                    print(f"✓ Creating new branch: {branch_name}")
+                    # Create from current main HEAD
+                    try:
+                        main_snapshot = self.repo.lookup_branch("main")
+                        self.repo.create_branch(branch_name, snapshot_id=main_snapshot)
+                    except Exception as e:
+                        print(f"Error creating branch {branch_name}: {e}")
+                        # If main doesn't exist, create from initial snapshot
+                        init_snapshot = self.repo.initial_snapshot()
+                        self.repo.create_branch(branch_name, snapshot_id=init_snapshot.id)
+                else:
+                    raise ValueError(f"Branch {branch_name} does not exist")
+            else:
+                print(f"✓ Branch {branch_name} already exists")
+            
+            # Switch to the branch
+            print(f"✓ Switching to branch: {branch_name}")
+            self.current_branch = branch_name
+            self.session = self.repo.writable_session(branch_name)
+            self.store = self.session.store
+            
+            # Reinitialize zarr groups for the new branch
+            self._initialize_zarr_groups()
+            
+            # Reset pending changes since we're on a new branch
+            self.has_pending_changes = False
+            
+            print(f"✓ Successfully switched to branch: {branch_name}")
+            
+        except Exception as e:
+            print(f"Error switching to branch {branch_name}: {e}")
+            raise

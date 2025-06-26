@@ -6,7 +6,7 @@ from typing_extensions import Annotated
 from typing import Optional
 import os
 
-from paramlake.repo import Repo
+from paramlake.repo import Repo, RepositoryError
 # from paramlake.utils.config import ParamLakeConfig # If needed for CLI-specific config loading
 
 app = typer.Typer(help="ParamLake: Git for AI Models.")
@@ -23,24 +23,42 @@ app.add_typer(remote_app)
 # --- Global state/config for CLI ---
 # This would typically be loaded from a .paramlake/config in the current directory
 # or from global user config. For now, simplified.
-CURRENT_REPO_PATH: Optional[str] = "." # Assume current directory is a repo or contains one.
+CURRENT_REPO_PATH: Optional[str] = None  # Will be auto-detected
+
+def find_repository_path() -> Optional[str]:
+    """Find the repository path by searching current and parent directories."""
+    global CURRENT_REPO_PATH
+    if CURRENT_REPO_PATH is None:
+        CURRENT_REPO_PATH = Repo.find_repository()
+    return CURRENT_REPO_PATH
 
 def get_repo_instance(path: Optional[str] = None) -> Repo:
-    effective_path = path if path else CURRENT_REPO_PATH
-    if not effective_path:
-        print("Error: Repository path not specified or found. Initialize with 'paramlake repo init <path>' or run from within a repo.")
-        raise typer.Exit(code=1)
-    try:
-        # Enhanced config for CLI usage
-        repo_config = {
-            "output_path": effective_path, 
-            "storage_type": "icechunk",
-            "git_features": {"enabled": True}
-        } 
-        return Repo(path=effective_path, config=repo_config)
-    except Exception as e:
-        print(f"Error opening repository at '{effective_path}': {e}")
-        raise typer.Exit(code=1)
+    """Get a repository instance, with enhanced connection logic."""
+    # Try the provided path first
+    if path:
+        try:
+            if Repo.is_repository(path):
+                return Repo.connect(path, auto_find=False)
+            else:
+                raise RepositoryError(f"No repository found at: {path}")
+        except RepositoryError as e:
+            print(f"Error: {e}")
+            raise typer.Exit(code=1)
+    
+    # Try to find repository automatically
+    repo_path = find_repository_path()
+    if repo_path:
+        try:
+            return Repo.connect(repo_path, auto_find=False)
+        except RepositoryError as e:
+            print(f"Error connecting to repository at {repo_path}: {e}")
+            raise typer.Exit(code=1)
+    
+    # No repository found
+    print("Error: No ParamLake repository found.")
+    print("Initialize a new repository with 'paramlake repo init' or")
+    print("connect to an existing one with 'paramlake repo connect <path>'")
+    raise typer.Exit(code=1)
 
 # --- `paramlake repo ...` commands ---
 @repo_app.command("init")
@@ -49,9 +67,10 @@ def repo_init(
     cloud: Annotated[Optional[str], typer.Option(help="Cloud backend (s3, gcs, azure)")] = None,
     bucket: Annotated[Optional[str], typer.Option(help="Cloud storage bucket")] = None,
     prefix: Annotated[Optional[str], typer.Option(help="Storage prefix")] = None,
-    region: Annotated[Optional[str], typer.Option(help="Cloud region")] = "us-east-1"
+    region: Annotated[Optional[str], typer.Option(help="Cloud region")] = "us-east-1",
+    force: Annotated[bool, typer.Option("--force", help="Force initialization even if repository exists")] = False
 ):
-    """Initializes a new ParamLake repository."""
+    """Initializes a new ParamLake repository or connects to existing one."""
     try:
         config = {
             "create_repo": True, 
@@ -68,8 +87,11 @@ def repo_init(
                 config["prefix"] = prefix
             config["region"] = region
         
-        repo = Repo(path=path, config=config)
-        print(f"Initialized empty ParamLake repository in {path}")
+        if force:
+            repo = Repo(path=path, config=config)
+            print(f"Initialized ParamLake repository in {path}")
+        else:
+            repo = Repo.init_or_connect(path=path, **config)
         
         if cloud:
             print(f"Using {cloud} cloud storage:")
@@ -77,9 +99,206 @@ def repo_init(
             print(f"  Prefix: {prefix}")
             print(f"  Region: {region}")
         
-        # TODO: Create .paramlake/config to store repo configuration
+        # Update global repo path for subsequent commands
+        global CURRENT_REPO_PATH
+        CURRENT_REPO_PATH = path
+        
+    except RepositoryError as e:
+        print(f"Error: {e}")
+        raise typer.Exit(code=1)
     except Exception as e:
         print(f"Error initializing repository: {e}")
+        raise typer.Exit(code=1)
+
+@repo_app.command("connect")
+def repo_connect(
+    path: Annotated[Optional[str], typer.Argument(help="Path to existing repository. If not provided, searches current directory.")] = None,
+    run_id: Annotated[Optional[str], typer.Option("--run-id", help="Specific run ID to connect to")] = None,
+    branch: Annotated[Optional[str], typer.Option("--branch", help="Branch to switch to after connecting")] = None,
+    verbose: Annotated[bool, typer.Option("--verbose", help="Show detailed connection information")] = False
+):
+    """Connect to an existing ParamLake repository."""
+    try:
+        # Connect to repository
+        config = {"verbose": verbose} if verbose else {}
+        repo = Repo.connect(path=path, run_id=run_id, config=config)
+        
+        # Switch to specific branch if requested
+        if branch:
+            try:
+                result = repo.switch_branch(branch)
+                if result.get('status') == 'success':
+                    print(f"Switched to branch: {branch}")
+                else:
+                    print(f"Warning: Could not switch to branch '{branch}': {result.get('message', 'Unknown error')}")
+            except Exception as e:
+                print(f"Warning: Could not switch to branch '{branch}': {e}")
+        
+        # Update global repo path
+        global CURRENT_REPO_PATH
+        CURRENT_REPO_PATH = repo.config.get('output_path')
+        
+        # Show additional info if verbose
+        if verbose:
+            status = repo.status()
+            print(f"\nRepository Status:")
+            for key, value in status.items():
+                print(f"  {key}: {value}")
+                
+    except RepositoryError as e:
+        print(f"Error: {e}")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        print(f"Error connecting to repository: {e}")
+        raise typer.Exit(code=1)
+
+@repo_app.command("info")
+def repo_info(
+    path: Annotated[Optional[str], typer.Argument(help="Path to repository to inspect. Defaults to current repository.")] = None,
+    detailed: Annotated[bool, typer.Option("--detailed", help="Show detailed information")] = False
+):
+    """Show information about a ParamLake repository."""
+    try:
+        # Determine which repository to inspect
+        if path is None:
+            path = find_repository_path()
+            if path is None:
+                print("Error: No repository specified and none found in current directory")
+                raise typer.Exit(code=1)
+        
+        if not Repo.is_repository(path):
+            print(f"Error: No ParamLake repository found at: {path}")
+            raise typer.Exit(code=1)
+        
+        info = Repo.get_repository_info(path)
+        
+        print(f"Repository Information:")
+        print(f"  Path: {info['path']}")
+        print(f"  Storage Type: {info['storage_type']}")
+        print(f"  Git Features: {'Yes' if info['has_git_features'] else 'No'}")
+        print(f"  Size: {info['repository_size']:,} bytes ({info['repository_size'] / (1024*1024):.1f} MB)")
+        
+        if info.get('current_branch'):
+            print(f"  Current Branch: {info['current_branch']}")
+        
+        if info.get('branches'):
+            print(f"  Branches ({len(info['branches'])}): {', '.join(info['branches'])}")
+        
+        if info.get('tags'):
+            print(f"  Tags ({len(info['tags'])}): {', '.join(info['tags'].keys())}")
+        
+        if info.get('last_commit') and detailed:
+            commit = info['last_commit']
+            print(f"  Last Commit:")
+            print(f"    ID: {commit.get('id', 'unknown')}")
+            print(f"    Message: {commit.get('message', 'No message')}")
+            print(f"    Author: {commit.get('author', 'Unknown')}")
+            print(f"    Date: {commit.get('timestamp', 'Unknown')}")
+        
+        if info.get('error'):
+            print(f"  Warning: {info['error']}")
+            
+    except Exception as e:
+        print(f"Error getting repository info: {e}")
+        raise typer.Exit(code=1)
+
+@repo_app.command("find")
+def repo_find(
+    start_path: Annotated[str, typer.Argument(help="Directory to start searching from")] = ".",
+    all_repos: Annotated[bool, typer.Option("--all", help="Find all repositories in subdirectories")] = False
+):
+    """Find ParamLake repositories in the current directory or subdirectories."""
+    try:
+        if all_repos:
+            # Search for all repositories in subdirectories
+            found_repos = []
+            start_path = os.path.abspath(start_path)
+            
+            for root, dirs, files in os.walk(start_path):
+                if Repo.is_repository(root):
+                    found_repos.append(root)
+            
+            if found_repos:
+                print(f"Found {len(found_repos)} ParamLake repositories:")
+                for repo_path in found_repos:
+                    print(f"  {repo_path}")
+            else:
+                print("No ParamLake repositories found.")
+        else:
+            # Find the nearest repository
+            repo_path = Repo.find_repository(start_path)
+            if repo_path:
+                print(f"Found ParamLake repository at: {repo_path}")
+                
+                # Show basic info
+                if Repo.is_repository(repo_path):
+                    info = Repo.get_repository_info(repo_path)
+                    print(f"  Storage Type: {info['storage_type']}")
+                    if info.get('current_branch'):
+                        print(f"  Current Branch: {info['current_branch']}")
+            else:
+                print("No ParamLake repository found in current directory or parent directories.")
+                
+    except Exception as e:
+        print(f"Error searching for repositories: {e}")
+        raise typer.Exit(code=1)
+
+@repo_app.command("validate")
+def repo_validate(
+    path: Annotated[Optional[str], typer.Argument(help="Path to repository to validate")] = None,
+    fix: Annotated[bool, typer.Option("--fix", help="Attempt to fix issues found")] = False
+):
+    """Validate a ParamLake repository and optionally fix issues."""
+    try:
+        if path is None:
+            path = find_repository_path()
+            if path is None:
+                print("Error: No repository specified and none found in current directory")
+                raise typer.Exit(code=1)
+        
+        print(f"Validating repository at: {path}")
+        
+        # Check if it's a valid repository
+        if not Repo.is_repository(path):
+            print("✗ Not a valid ParamLake repository")
+            raise typer.Exit(code=1)
+        
+        print("✓ Valid ParamLake repository detected")
+        
+        # Try to connect and perform basic operations
+        try:
+            repo = Repo.connect(path, auto_find=False)
+            print("✓ Successfully connected to repository")
+            
+            # Test basic operations
+            try:
+                status = repo.status()
+                print("✓ Repository status accessible")
+            except Exception as e:
+                print(f"✗ Could not get repository status: {e}")
+            
+            try:
+                branches = repo.list_branches()
+                print(f"✓ Found {len(branches)} branches")
+            except Exception as e:
+                print(f"✗ Could not list branches: {e}")
+            
+            try:
+                tags = repo.list_tags()
+                print(f"✓ Found {len(tags)} tags")
+            except Exception as e:
+                print(f"✗ Could not list tags: {e}")
+                
+        except Exception as e:
+            print(f"✗ Could not connect to repository: {e}")
+            if fix:
+                print("Fix mode not implemented yet")
+            raise typer.Exit(code=1)
+        
+        print("✓ Repository validation completed successfully")
+        
+    except Exception as e:
+        print(f"Error validating repository: {e}")
         raise typer.Exit(code=1)
 
 @repo_app.command("commit")

@@ -9,7 +9,6 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
-import tensorflow as tf
 import yaml
 import zarr
 
@@ -22,418 +21,445 @@ from paramlake.storage.zarr_manager import ZarrStorageManager
 from paramlake.utils.config import ParamLakeConfig
 from paramlake.storage.factory import create_storage_manager
 from paramlake.storage.storage_interface import StorageInterface
+from paramlake.utils.framework_utils import HAS_TENSORFLOW, require_tensorflow
+
+# Optional TensorFlow import
+if HAS_TENSORFLOW:
+    import tensorflow as tf
+else:
+    tf = None
 
 
-class ParamLakeCallback(tf.keras.callbacks.Callback):
-    """
-    TensorFlow/Keras callback for automatic parameter tracking with git-like version control.
-    """
-
-    def __init__(
-        self,
-        storage_manager: StorageInterface,
-        config: Optional[ParamLakeConfig] = None,
-        collect_weights: bool = True,
-        collect_gradients: bool = False,
-        collect_activations: bool = False,
-        collect_optimizer: bool = False,
-        track_layers: Optional[List[str]] = None,
-        ignore_layers: Optional[List[str]] = None,
-    ):
+# TensorFlow-specific callback class
+if HAS_TENSORFLOW:
+    class ParamLakeCallback(tf.keras.callbacks.Callback):
         """
-        Initialize the ParamLake callback.
-
-        Args:
-            storage_manager: Storage manager instance
-            config: Configuration object
-            collect_weights: Whether to collect weights
-            collect_gradients: Whether to collect gradients
-            collect_activations: Whether to collect activations
-            collect_optimizer: Whether to collect optimizer state
-            track_layers: Specific layers to track (if None, tracks all)
-            ignore_layers: Layers to ignore
+        TensorFlow/Keras callback for automatic parameters tracking with git-like version control.
         """
-        super().__init__()
 
-        self.storage_manager = storage_manager
-        self.config = config or ParamLakeConfig()
-        
-        # Initialize collectors
-        self.collectors = []
-        
-        # Store collection configuration for later access
-        self.collect_weights = collect_weights
-        self.collect_gradients = collect_gradients
-        self.collect_activations = collect_activations
-        self.collect_optimizer = collect_optimizer
-        
-        # Store collector references for direct access
-        self.weight_collector = None
-        self.gradient_collector = None
-        self.activation_collector = None
-        self.optimizer_collector = None
-        self.metrics_collector = None
-        
-        if collect_weights:
-            # WeightCollector expects: storage_manager, config, track_layers, ignore_layers
-            self.weight_collector = WeightCollector(
-                storage_manager=storage_manager,
-                config=config,
-                track_layers=track_layers,
-                ignore_layers=ignore_layers,
-            )
-            self.collectors.append(self.weight_collector)
+        def __init__(
+            self,
+            storage_manager: StorageInterface,
+            config: Optional[ParamLakeConfig] = None,
+            collect_weights: bool = True,
+            collect_gradients: bool = False,
+            collect_activations: bool = False,
+            collect_optimizer: bool = False,
+            track_layers: Optional[List[str]] = None,
+            ignore_layers: Optional[List[str]] = None,
+        ):
+            """
+            Initialize the ParamLake callback.
+
+            Args:
+                storage_manager: Storage manager instance
+                config: Configuration object
+                collect_weights: Whether to collect weights
+                collect_gradients: Whether to collect gradients
+                collect_activations: Whether to collect activations
+                collect_optimizer: Whether to collect optimizer state
+                track_layers: Specific layers to track (if None, tracks all)
+                ignore_layers: Layers to ignore
+            """
+            super().__init__()
+
+            self.storage_manager = storage_manager
+            self.config = config or ParamLakeConfig()
             
-        if collect_gradients:
-            # GradientCollector expects: storage_manager, include_layers, exclude_layers, include_types
-            self.gradient_collector = GradientCollector(
-                storage_manager=storage_manager,
-                include_layers=track_layers,  # Map track_layers to include_layers
-                exclude_layers=ignore_layers,  # Map ignore_layers to exclude_layers
-                include_types=None,  # Not provided by callback interface
-            )
-            self.collectors.append(self.gradient_collector)
+            # Initialize collectors
+            self.collectors = []
             
-        if collect_activations:
-            # ActivationCollector expects: storage_manager, include_layers, exclude_layers, include_types
-            self.activation_collector = ActivationCollector(
-                storage_manager=storage_manager,
-                include_layers=track_layers,  # Map track_layers to include_layers
-                exclude_layers=ignore_layers,  # Map ignore_layers to exclude_layers
-                include_types=None,  # Not provided by callback interface
-            )
-            self.collectors.append(self.activation_collector)
+            # Store collection configuration for later access
+            self.collect_weights = collect_weights
+            self.collect_gradients = collect_gradients
+            self.collect_activations = collect_activations
+            self.collect_optimizer = collect_optimizer
             
-        if collect_optimizer:
-            # OptimizerCollector expects: storage_manager only
-            self.optimizer_collector = OptimizerCollector(
-                storage_manager=storage_manager,
-            )
-            self.collectors.append(self.optimizer_collector)
+            # Store collector references for direct access
+            self.weight_collector = None
+            self.gradient_collector = None
+            self.activation_collector = None
+            self.optimizer_collector = None
+            self.metrics_collector = None
             
-        # Metrics collector is always included
-        # MetricsCollector expects: storage_manager, enabled_metrics, include_layers, exclude_layers, capture_frequency
-        metrics_config = config.get("metrics", {}) if config else {}
-        self.metrics_collector = MetricsCollector(
-            storage_manager=storage_manager,
-            enabled_metrics=metrics_config.get("compute", ["l2", "mean", "var", "max", "min", "sparsity"]),
-            include_layers=track_layers,  # Map track_layers to include_layers
-            exclude_layers=ignore_layers,  # Map ignore_layers to exclude_layers
-            capture_frequency=metrics_config.get("capture_frequency", 1),
-        )
-        self.collectors.append(self.metrics_collector)
-
-        # Git integration settings
-        self.auto_commit_enabled = config.get("git", {}).get("auto_commit", False) if config else False
-        self.auto_tag_enabled = config.get("git", {}).get("auto_tag", False) if config else False
-        self.commit_frequency = config.get("git", {}).get("commit_frequency", 10) if config else 10
-        
-        # Track the last epoch we committed to avoid duplicate commits
-        self.last_commit_epoch = -1
-        
-        # Add attributes for gradient tracking compatibility
-        self._gradient_tracking_enabled = False
-        self.auto_gradient_tracking = collect_gradients
-        self.current_epoch = 0
-
-    def on_train_begin(self, logs: Optional[Dict[str, Any]] = None) -> None:
-        """Called at the beginning of training."""
-        for collector in self.collectors:
-            if hasattr(collector, 'on_train_begin'):
-                collector.on_train_begin(self.model, logs)
-        
-        # Set step for storage manager
-        self.storage_manager.set_step(0)
-
-    def on_epoch_begin(self, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
-        """Called at the beginning of each epoch."""
-        self.current_epoch = epoch  # Track current epoch
-        
-        for collector in self.collectors:
-            if hasattr(collector, 'on_epoch_begin'):
-                collector.on_epoch_begin(epoch, self.model, logs)
-        
-        # Update storage manager step
-        self.storage_manager.set_step(epoch)
-
-    def on_epoch_end(self, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
-        """Called at the end of each epoch."""
-        self.current_epoch = epoch  # Update current epoch
-        
-        # Collect data from all collectors
-        for collector in self.collectors:
-            if hasattr(collector, 'on_epoch_end'):
-                collector.on_epoch_end(epoch, self.model, logs)
-
-        # Handle git-aware commits using centralized logic
-        if hasattr(self.storage_manager, 'commit_if_needed'):
-            # Use the centralized commit mechanism to avoid conflicts
-            snapshot_id = self.storage_manager.commit_if_needed(
-                step=epoch,
-                force=False,  # Let the storage manager decide based on auto-commit settings
-                message=f"Training progress at epoch {epoch + 1}"
-            )
-            
-            if snapshot_id:
-                self.last_commit_epoch = epoch
-        elif self.auto_commit_enabled:
-            # Fallback for storage managers without centralized commit logic
-            epoch_num = epoch + 1
-            if (epoch_num % self.commit_frequency == 0 and 
-                epoch != self.last_commit_epoch):
+            if collect_weights:
+                # WeightCollector expects: storage_manager, config, track_layers, ignore_layers
+                self.weight_collector = WeightCollector(
+                    storage_manager=storage_manager,
+                    config=config,
+                    track_layers=track_layers,
+                    ignore_layers=ignore_layers,
+                )
+                self.collectors.append(self.weight_collector)
                 
-                try:
-                    snapshot_id = self.storage_manager.commit_changes(
-                        f"Training progress at epoch {epoch_num}"
-                    )
-                    if snapshot_id:
-                        self.last_commit_epoch = epoch
-                        print(f"✓ Committed training progress at epoch {epoch_num}")
-                        
-                        # Auto-tag if enabled
-                        if (self.auto_tag_enabled and 
-                            hasattr(self.storage_manager, 'create_tag')):
-                            tag_name = f"epoch_{epoch_num}"
-                            try:
-                                self.storage_manager.create_tag(
-                                    tag_name, 
-                                    snapshot_id, 
-                                    f"Epoch {epoch_num} checkpoint"
-                                )
-                                print(f"✓ Tagged: {tag_name}")
-                            except Exception as e:
-                                print(f"Warning: Could not create tag {tag_name}: {e}")
-                                
-                except Exception as e:
-                    print(f"Warning: Could not commit at epoch {epoch_num}: {e}")
-
-    def on_train_end(self, logs: Optional[Dict[str, Any]] = None) -> None:
-        """Called at the end of training."""
-        for collector in self.collectors:
-            if hasattr(collector, 'on_train_end'):
-                collector.on_train_end(self.model, logs)
-
-        # Final commit if there are uncommitted changes
-        if hasattr(self.storage_manager, 'commit_if_needed'):
-            # Force a final commit regardless of frequency
-            snapshot_id = self.storage_manager.commit_if_needed(
-                step=getattr(self, 'current_epoch', 0),
-                force=True,
-                message="Final training state"
+            if collect_gradients:
+                # GradientCollector expects: storage_manager, include_layers, exclude_layers, include_types
+                self.gradient_collector = GradientCollector(
+                    storage_manager=storage_manager,
+                    include_layers=track_layers,  # Map track_layers to include_layers
+                    exclude_layers=ignore_layers,  # Map ignore_layers to exclude_layers
+                    include_types=None,  # Not provided by callback interface
+                )
+                self.collectors.append(self.gradient_collector)
+                
+            if collect_activations:
+                # ActivationCollector expects: storage_manager, include_layers, exclude_layers, include_types
+                self.activation_collector = ActivationCollector(
+                    storage_manager=storage_manager,
+                    include_layers=track_layers,  # Map track_layers to include_layers
+                    exclude_layers=ignore_layers,  # Map ignore_layers to exclude_layers
+                    include_types=None,  # Not provided by callback interface
+                )
+                self.collectors.append(self.activation_collector)
+                
+            if collect_optimizer:
+                # OptimizerCollector expects: storage_manager only
+                self.optimizer_collector = OptimizerCollector(
+                    storage_manager=storage_manager,
+                )
+                self.collectors.append(self.optimizer_collector)
+                
+            # Metrics collector is always included
+            # MetricsCollector expects: storage_manager, enabled_metrics, include_layers, exclude_layers, capture_frequency
+            metrics_config = config.get("metrics", {}) if config else {}
+            self.metrics_collector = MetricsCollector(
+                storage_manager=storage_manager,
+                enabled_metrics=metrics_config.get("compute", ["l2", "mean", "var", "max", "min", "sparsity"]),
+                include_layers=track_layers,  # Map track_layers to include_layers
+                exclude_layers=ignore_layers,  # Map ignore_layers to exclude_layers
+                capture_frequency=metrics_config.get("capture_frequency", 1),
             )
-            if snapshot_id:
-                print(f"✓ Final commit: {snapshot_id}")
-        else:
-            # Fallback commit
-            try:
-                snapshot_id = self.storage_manager.commit_changes("Final training state")
+            self.collectors.append(self.metrics_collector)
+
+            # Git integration settings
+            self.auto_commit_enabled = config.get("git", {}).get("auto_commit", False) if config else False
+            self.auto_tag_enabled = config.get("git", {}).get("auto_tag", False) if config else False
+            self.commit_frequency = config.get("git", {}).get("commit_frequency", 10) if config else 10
+            
+            # Track the last epoch we committed to avoid duplicate commits
+            self.last_commit_epoch = -1
+            
+            # Add attributes for gradient tracking compatibility
+            self._gradient_tracking_enabled = False
+            self.auto_gradient_tracking = collect_gradients
+            self.current_epoch = 0
+
+        def on_train_begin(self, logs: Optional[Dict[str, Any]] = None) -> None:
+            """Called at the beginning of training."""
+            for collector in self.collectors:
+                if hasattr(collector, 'on_train_begin'):
+                    collector.on_train_begin(self.model, logs)
+            
+            # Set step for storage manager
+            self.storage_manager.set_step(0)
+
+        def on_epoch_begin(self, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
+            """Called at the beginning of each epoch."""
+            self.current_epoch = epoch  # Track current epoch
+            
+            for collector in self.collectors:
+                if hasattr(collector, 'on_epoch_begin'):
+                    collector.on_epoch_begin(epoch, self.model, logs)
+            
+            # Update storage manager step
+            self.storage_manager.set_step(epoch)
+
+        def on_epoch_end(self, epoch: int, logs: Optional[Dict[str, Any]] = None) -> None:
+            """Called at the end of each epoch."""
+            self.current_epoch = epoch  # Update current epoch
+            
+            # Collect data from all collectors
+            for collector in self.collectors:
+                if hasattr(collector, 'on_epoch_end'):
+                    collector.on_epoch_end(epoch, self.model, logs)
+
+            # Handle git-aware commits using centralized logic
+            if hasattr(self.storage_manager, 'commit_if_needed'):
+                # Use the centralized commit mechanism to avoid conflicts
+                snapshot_id = self.storage_manager.commit_if_needed(
+                    step=epoch,
+                    force=False,  # Let the storage manager decide based on auto-commit settings
+                    message=f"Training progress at epoch {epoch + 1}"
+                )
+                
+                if snapshot_id:
+                    self.last_commit_epoch = epoch
+            elif self.auto_commit_enabled:
+                # Fallback for storage managers without centralized commit logic
+                epoch_num = epoch + 1
+                if (epoch_num % self.commit_frequency == 0 and 
+                    epoch != self.last_commit_epoch):
+                    
+                    try:
+                        snapshot_id = self.storage_manager.commit_changes(
+                            f"Training progress at epoch {epoch_num}"
+                        )
+                        if snapshot_id:
+                            self.last_commit_epoch = epoch
+                            print(f"✓ Committed training progress at epoch {epoch_num}")
+                            
+                            # Auto-tag if enabled
+                            if (self.auto_tag_enabled and 
+                                hasattr(self.storage_manager, 'create_tag')):
+                                tag_name = f"epoch_{epoch_num}"
+                                try:
+                                    self.storage_manager.create_tag(
+                                        tag_name, 
+                                        snapshot_id, 
+                                        f"Epoch {epoch_num} checkpoint"
+                                    )
+                                    print(f"✓ Tagged: {tag_name}")
+                                except Exception as e:
+                                    print(f"Warning: Could not create tag {tag_name}: {e}")
+                                    
+                    except Exception as e:
+                        print(f"Warning: Could not commit at epoch {epoch_num}: {e}")
+
+        def on_train_end(self, logs: Optional[Dict[str, Any]] = None) -> None:
+            """Called at the end of training."""
+            for collector in self.collectors:
+                if hasattr(collector, 'on_train_end'):
+                    collector.on_train_end(self.model, logs)
+
+            # Final commit if there are uncommitted changes
+            if hasattr(self.storage_manager, 'commit_if_needed'):
+                # Force a final commit regardless of frequency
+                snapshot_id = self.storage_manager.commit_if_needed(
+                    step=getattr(self, 'current_epoch', 0),
+                    force=True,
+                    message="Final training state"
+                )
                 if snapshot_id:
                     print(f"✓ Final commit: {snapshot_id}")
+            else:
+                # Fallback commit
+                try:
+                    snapshot_id = self.storage_manager.commit_changes("Final training state")
+                    if snapshot_id:
+                        print(f"✓ Final commit: {snapshot_id}")
+                except Exception as e:
+                    print(f"Warning: Could not perform final commit: {e}")
+
+        def on_batch_end(self, batch: int, logs: Optional[Dict[str, Any]] = None) -> None:
+            """Called at the end of each batch."""
+            for collector in self.collectors:
+                if hasattr(collector, 'on_batch_end'):
+                    collector.on_batch_end(batch, self.model, logs)
+
+        def close(self) -> None:
+            """Clean up resources and ensure data is saved."""
+            try:
+                # Close storage manager
+                if hasattr(self.storage_manager, 'close'):
+                    self.storage_manager.close()
             except Exception as e:
-                print(f"Warning: Could not perform final commit: {e}")
-
-    def on_batch_end(self, batch: int, logs: Optional[Dict[str, Any]] = None) -> None:
-        """Called at the end of each batch."""
-        for collector in self.collectors:
-            if hasattr(collector, 'on_batch_end'):
-                collector.on_batch_end(batch, self.model, logs)
-
-    def close(self) -> None:
-        """Clean up resources and ensure data is saved."""
-        try:
-            # Close storage manager
-            if hasattr(self.storage_manager, 'close'):
-                self.storage_manager.close()
-        except Exception as e:
-            print(f"Warning: Error closing storage manager: {e}")
+                print(f"Warning: Error closing storage manager: {e}")
 
 
-class ModelWrapper:
-    """
-    Wrapper for TensorFlow model with ParamLake integration.
-    
-    This wrapper adds functionality to capture model state during training.
-    """
-
-    def __init__(
-        self,
-        model: tf.keras.Model,
-        config: ParamLakeConfig,
-    ):
+    class ModelWrapper:
         """
-        Initialize model wrapper.
+        Wrapper for TensorFlow model with ParamLake integration.
         
-        Args:
-            model: TensorFlow model
-            config: ParamLake configuration
+        This wrapper adds functionality to capture model state during training.
         """
-        self.model = model
-        self.config = config
-        
-        # Create storage manager
-        self.storage = self._initialize_storage(config)
-        
-        # Create collectors
-        self.weight_collector = WeightCollector(
-            self.storage,
-            capture_trainable=config["capture_weights"],
-            capture_non_trainable=config["capture_non_trainable"],
-            include_layers=config["include_layers"],
-            exclude_layers=config["exclude_layers"],
-            include_types=config["include_types"],
-        )
-        
-        self.gradient_collector = GradientCollector(
-            self.storage,
-            include_layers=config["include_layers"],
-            exclude_layers=config["exclude_layers"],
-            include_types=config["include_types"],
-        )
-        
-        self.activation_collector = None
-        if config["capture_activations"]:
-            self.activation_collector = ActivationCollector(
+
+        def __init__(
+            self,
+            model: tf.keras.Model,
+            config: ParamLakeConfig,
+        ):
+            """
+            Initialize model wrapper.
+            
+            Args:
+                model: TensorFlow model
+                config: ParamLake configuration
+            """
+            self.model = model
+            self.config = config
+            
+            # Create storage manager
+            self.storage = self._initialize_storage(config)
+            
+            # Create collectors
+            self.weight_collector = WeightCollector(
+                self.storage,
+                capture_trainable=config["capture_weights"],
+                capture_non_trainable=config["capture_non_trainable"],
+                include_layers=config["include_layers"],
+                exclude_layers=config["exclude_layers"],
+                include_types=config["include_types"],
+            )
+            
+            self.gradient_collector = GradientCollector(
                 self.storage,
                 include_layers=config["include_layers"],
                 exclude_layers=config["exclude_layers"],
                 include_types=config["include_types"],
             )
             
-            # Load sample batch if provided
-            sample_batch = config["activations"]["sample_batch"]
-            if sample_batch and os.path.exists(sample_batch):
-                try:
-                    # Load sample batch from file
-                    self.sample_input = np.load(sample_batch)
-                    self.activation_collector.set_sample_input(self.sample_input)
-                except:
-                    self.sample_input = None
-            else:
-                self.sample_input = None
-        
-        self.optimizer_collector = None
-        if config.get("capture_optimizer_state", True):
-            self.optimizer_collector = OptimizerCollector(self.storage)
-        
-        # Create callback
-        self.callback = ParamLakeCallback(
-            storage_manager=self.storage,
-            config=config,
-            collect_weights=config["capture_weights"],
-            collect_gradients=config["capture_gradients"],
-            collect_activations=config["capture_activations"],
-            collect_optimizer=config.get("capture_optimizer_state", True),
-            track_layers=config["include_layers"],
-            ignore_layers=config["exclude_layers"],
-        )
-        
-        # Set up custom train_step if model supports it
-        self._original_train_step = None
-        if hasattr(model, "train_step") and callable(model.train_step):
-            self._original_train_step = model.train_step
-            model.train_step = self._wrapped_train_step
-            
-    def __call__(self, *args, **kwargs):
-        """
-        Make the wrapped model callable.
-        
-        This allows the wrapped model to be used directly in custom training loops.
-        
-        Args:
-            *args: Arguments to pass to the model's call method
-            **kwargs: Keyword arguments to pass to the model's call method
-            
-        Returns:
-            Output from the model's call method
-        """
-        return self.model(*args, **kwargs)
-    
-    def _wrapped_train_step(self, data):
-        """
-        Wrapped train_step method for capturing model state during custom training.
-        
-        Args:
-            data: Training data
-            
-        Returns:
-            Results from the original train_step
-        """
-        # Store data for gradient capture
-        x, y = data
-        self.sample_data = x
-        
-        # Use gradient tape to capture gradients directly
-        with tf.GradientTape() as tape:
-            # Forward pass
-            logits = self.model(x, training=True)
-            # Compute loss
-            loss = self.model.compiled_loss(y, logits, regularization_losses=self.model.losses)
-        
-        # Calculate gradients
-        gradients = tape.gradient(loss, self.model.trainable_variables)
-        
-        # Apply gradients with optimizer
-        self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        
-        # Update metrics
-        self.model.compiled_metrics.update_state(y, logits)
-        
-        # Get current step
-        step = self.storage.current_step
-        
-        # Store gradients directly if enabled
-        if self.config["capture_gradients"] and step % self.callback.capture_frequency == 0:
-            # Explicitly store gradients through the gradient collector
-            try:
-                print(f"Directly storing gradients at step {step}")
-                self.gradient_collector.capture_gradients(gradients, self.model.trainable_variables, step)
-            except Exception as e:
-                import traceback
-                print(f"Error directly storing gradients: {e}")
-                traceback.print_exc()
-        
-        # Return dict with metrics
-        return {m.name: m.result() for m in self.model.metrics}
-    
-    def __getattr__(self, name):
-        """
-        Delegate attribute access to the wrapped model.
-        
-        Args:
-            name: Name of the attribute
-            
-        Returns:
-            Attribute from the wrapped model
-        """
-        if name in self.__dict__:
-            return self.__dict__[name]
-        return getattr(self.model, name)
-    
-    def close(self):
-        """Close the storage manager and release resources."""
-        if hasattr(self, "storage"):
-            self.storage.close()
-            
-        # Restore original train_step if it was wrapped
-        if self._original_train_step is not None and hasattr(self.model, "train_step"):
-            self.model.train_step = self._original_train_step
-
-    def _initialize_storage(self, config):
-        """Initialize the appropriate storage backend."""
-        storage_type = config.get("storage_type", "zarr")
-        
-        if storage_type == "icechunk":
-            try:
-                from paramlake.storage.icechunk_manager import IcechunkStorageManager
-                return IcechunkStorageManager(config)
-            except ImportError:
-                raise ImportError(
-                    "Icechunk storage backend requested but Icechunk is not installed. "
-                    "Install it with 'pip install icechunk'."
+            self.activation_collector = None
+            if config["capture_activations"]:
+                self.activation_collector = ActivationCollector(
+                    self.storage,
+                    include_layers=config["include_layers"],
+                    exclude_layers=config["exclude_layers"],
+                    include_types=config["include_types"],
                 )
-        else:
-            from paramlake.storage.zarr_manager import ZarrStorageManager
-            return ZarrStorageManager(config)
+                
+                # Load sample batch if provided
+                sample_batch = config["activations"]["sample_batch"]
+                if sample_batch and os.path.exists(sample_batch):
+                    try:
+                        # Load sample batch from file
+                        self.sample_input = np.load(sample_batch)
+                        self.activation_collector.set_sample_input(self.sample_input)
+                    except:
+                        self.sample_input = None
+                else:
+                    self.sample_input = None
+            
+            self.optimizer_collector = None
+            if config.get("capture_optimizer_state", True):
+                self.optimizer_collector = OptimizerCollector(self.storage)
+            
+            # Create callback
+            self.callback = ParamLakeCallback(
+                storage_manager=self.storage,
+                config=config,
+                collect_weights=config["capture_weights"],
+                collect_gradients=config["capture_gradients"],
+                collect_activations=config["capture_activations"],
+                collect_optimizer=config.get("capture_optimizer_state", True),
+                track_layers=config["include_layers"],
+                ignore_layers=config["exclude_layers"],
+            )
+            
+            # Set up custom train_step if model supports it
+            self._original_train_step = None
+            if hasattr(model, "train_step") and callable(model.train_step):
+                self._original_train_step = model.train_step
+                model.train_step = self._wrapped_train_step
+                
+        def __call__(self, *args, **kwargs):
+            """
+            Make the wrapped model callable.
+            
+            This allows the wrapped model to be used directly in custom training loops.
+            
+            Args:
+                *args: Arguments to pass to the model's call method
+                **kwargs: Keyword arguments to pass to the model's call method
+                
+            Returns:
+                Output from the model's call method
+            """
+            return self.model(*args, **kwargs)
+        
+        def _wrapped_train_step(self, data):
+            """
+            Wrapped train_step method for capturing model state during custom training.
+            
+            Args:
+                data: Training data
+                
+            Returns:
+                Results from the original train_step
+            """
+            # Store data for gradient capture
+            x, y = data
+            self.sample_data = x
+            
+            # Use gradient tape to capture gradients directly
+            with tf.GradientTape() as tape:
+                # Forward pass
+                logits = self.model(x, training=True)
+                # Compute loss
+                loss = self.model.compiled_loss(y, logits, regularization_losses=self.model.losses)
+            
+            # Calculate gradients
+            gradients = tape.gradient(loss, self.model.trainable_variables)
+            
+            # Apply gradients with optimizer
+            self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+            
+            # Update metrics
+            self.model.compiled_metrics.update_state(y, logits)
+            
+            # Get current step
+            step = self.storage.current_step
+            
+            # Store gradients directly if enabled
+            if self.config["capture_gradients"] and step % self.callback.capture_frequency == 0:
+                # Explicitly store gradients through the gradient collector
+                try:
+                    print(f"Directly storing gradients at step {step}")
+                    self.gradient_collector.capture_gradients(gradients, self.model.trainable_variables, step)
+                except Exception as e:
+                    import traceback
+                    print(f"Error directly storing gradients: {e}")
+                    traceback.print_exc()
+            
+            # Return dict with metrics
+            return {m.name: m.result() for m in self.model.metrics}
+        
+        def __getattr__(self, name):
+            """
+            Delegate attribute access to the wrapped model.
+            
+            Args:
+                name: Name of the attribute
+                
+            Returns:
+                Attribute from the wrapped model
+            """
+            if name in self.__dict__:
+                return self.__dict__[name]
+            return getattr(self.model, name)
+        
+        def close(self):
+            """Close the storage manager and release resources."""
+            if hasattr(self, "storage"):
+                self.storage.close()
+                
+            # Restore original train_step if it was wrapped
+            if self._original_train_step is not None and hasattr(self.model, "train_step"):
+                self.model.train_step = self._original_train_step
+
+        def _initialize_storage(self, config):
+            """Initialize the appropriate storage backend."""
+            storage_type = config.get("storage_type", "zarr")
+            
+            if storage_type == "icechunk":
+                try:
+                    from paramlake.storage.icechunk_manager import IcechunkStorageManager
+                    return IcechunkStorageManager(config)
+                except ImportError:
+                    raise ImportError(
+                        "Icechunk storage backend requested but Icechunk is not installed. "
+                        "Install it with 'pip install icechunk'."
+                    )
+            else:
+                from paramlake.storage.zarr_manager import ZarrStorageManager
+                return ZarrStorageManager(config)
+
+else:
+    # Dummy classes when TensorFlow is not available
+    class ParamLakeCallback:
+        """Dummy callback class when TensorFlow is not available."""
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "TensorFlow is required for ParamLakeCallback. "
+                "Install with: pip install 'paramlake[tf]' or pip install tensorflow"
+            )
+    
+    class ModelWrapper:
+        """Dummy model wrapper when TensorFlow is not available."""
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "TensorFlow is required for ModelWrapper. "
+                "Install with: pip install 'paramlake[tf]' or pip install tensorflow"
+            )
 
 
 def load_config(config=None, **kwargs):
@@ -499,6 +525,21 @@ def paramlake(func=None, config=None, **kwargs):
     Returns:
         Decorated function
     """
+    # Check if TensorFlow is available for the decorator
+    if not HAS_TENSORFLOW:
+        def _no_tensorflow_decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                raise ImportError(
+                    "TensorFlow is required for the @paramlake decorator. "
+                    "Install with: pip install 'paramlake[tf]' or pip install tensorflow"
+                )
+            return wrapper
+        
+        if func is not None:
+            return _no_tensorflow_decorator(func)
+        return _no_tensorflow_decorator
+    
     # Initialize params dictionary
     if not hasattr(paramlake, 'params'):
         paramlake.params = {}

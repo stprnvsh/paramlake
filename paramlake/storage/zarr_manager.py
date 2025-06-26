@@ -17,6 +17,7 @@ from numcodecs import Zstd, Blosc
 
 from paramlake.utils.config import ParamLakeConfig
 from paramlake.storage.storage_interface import StorageInterface
+from paramlake.utils.framework_utils import HAS_TENSORFLOW
 
 
 class ZarrStorageManager(StorageInterface):
@@ -112,13 +113,20 @@ class ZarrStorageManager(StorageInterface):
     
     def _initialize_run_metadata(self) -> None:
         """Initialize metadata for the current run."""
-        import tensorflow as tf
         from datetime import datetime
         
         # Store basic metadata
         self.run_group.attrs["paramlake_version"] = "0.1.0"
-        self.run_group.attrs["framework"] = "tensorflow"
-        self.run_group.attrs["framework_version"] = tf.__version__
+        
+        # Only set framework info if TensorFlow is available
+        if HAS_TENSORFLOW:
+            import tensorflow as tf
+            self.run_group.attrs["framework"] = "tensorflow"
+            self.run_group.attrs["framework_version"] = tf.__version__
+        else:
+            self.run_group.attrs["framework"] = "unknown"
+            self.run_group.attrs["framework_version"] = "N/A"
+            
         self.run_group.attrs["timestamp"] = datetime.now().isoformat()
         self.run_group.attrs["current_step"] = 0
         

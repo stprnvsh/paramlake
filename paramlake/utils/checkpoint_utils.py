@@ -1,17 +1,29 @@
 """
-Checkpoint utilities for saving and loading model state with git-like version control integration.
+Checkpoint utilities for ParamLake.
+
+This module provides high-level utilities for saving and loading model checkpoints
+with git-like version control capabilities.
 """
 
+import json
+import time
 from typing import Any, Dict, List, Optional, Union
+from datetime import datetime
 
 import numpy as np
-import tensorflow as tf
 
 from paramlake.storage.storage_interface import StorageInterface
+from paramlake.utils.framework_utils import HAS_TENSORFLOW, require_tensorflow
+
+# Optional TensorFlow import
+if HAS_TENSORFLOW:
+    import tensorflow as tf
+else:
+    tf = None
 
 
 def save_checkpoint(
-    model: tf.keras.Model,
+    model: Any,  # Changed from tf.keras.Model to Any for compatibility
     storage_manager: StorageInterface,
     step: Optional[int] = None,
     include_optimizer: bool = True,
@@ -21,83 +33,89 @@ def save_checkpoint(
     tag_name: Optional[str] = None,
 ) -> str:
     """
-    Save a checkpoint of model weights and optimizer state.
+    Save a model checkpoint with version control.
     
     Args:
-        model: TensorFlow model to save
+        model: Model to save (TensorFlow model if TF is available)
         storage_manager: Storage manager instance
-        step: Step number (if None, uses storage manager's current step)
+        step: Current training step
         include_optimizer: Whether to include optimizer state
-        name: Name for the checkpoint (if None, uses "checkpoint_{step}")
-        description: Optional description of the checkpoint
-        create_tag: Whether to create a Git-like tag for this checkpoint
-        tag_name: Name for the tag (if None and create_tag=True, uses checkpoint name)
+        name: Custom checkpoint name
+        description: Checkpoint description
+        create_tag: Whether to create a tag for this checkpoint
+        tag_name: Custom tag name
         
     Returns:
-        Checkpoint ID or snapshot ID
+        Checkpoint ID/snapshot ID
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
-    # Use provided step or current step
-    current_step = step if step is not None else storage_manager.current_step
+    if not HAS_TENSORFLOW:
+        require_tensorflow()  # This will raise the appropriate error
     
-    # Generate checkpoint name if not provided
-    checkpoint_name = name if name is not None else f"checkpoint_{current_step}"
+    # Verify model is TensorFlow model
+    if not isinstance(model, tf.keras.Model):
+        raise ValueError("Model must be a TensorFlow/Keras model when TensorFlow is available")
     
-    # Create a dictionary with metadata
-    metadata = {
-        "name": checkpoint_name,
-        "step": current_step,
-        "description": description,
-        "timestamp": None,  # Will be filled by storage manager
-        "include_optimizer": include_optimizer,
-        "framework": "tensorflow",
-        "model_summary": _get_model_summary(model),
-    }
+    # Generate step if not provided
+    if step is None:
+        step = storage_manager.current_step
     
-    # Save the model weights
-    # We convert to a simple list of numpy arrays for storage
+    # Extract model parameters
     weights_data = []
-    weights_shapes = []
     weights_names = []
+    weights_shapes = []
     
     for layer in model.layers:
-        for weight in layer.weights:
-            weights_data.append(weight.numpy())
+        layer_weights = layer.get_weights()
+        for i, weight in enumerate(layer_weights):
+            weights_data.append(weight)
+            weights_names.append(f"{layer.name}/weight_{i}")
             weights_shapes.append(weight.shape)
-            weights_names.append(weight.name)
     
-    # Save optimizer state if requested
+    # Extract optimizer state if requested
     optimizer_data = []
     optimizer_config = None
     
     if include_optimizer and hasattr(model, 'optimizer') and model.optimizer is not None:
-        optimizer = model.optimizer
-        
-        # Get optimizer config
-        optimizer_config = optimizer.get_config()
-        
-        # Get optimizer weights
-        if hasattr(optimizer, 'weights') and optimizer.weights:
-            for weight in optimizer.weights:
-                optimizer_data.append(weight.numpy())
+        try:
+            # Get optimizer weights
+            optimizer_weights = model.optimizer.get_weights()
+            optimizer_data = optimizer_weights
+            
+            # Get optimizer config
+            optimizer_config = model.optimizer.get_config()
+        except Exception as e:
+            print(f"Warning: Could not extract optimizer state: {e}")
+            optimizer_data = []
+            optimizer_config = None
     
-    # Compile configuration if model is compiled
+    # Get model compile configuration
     compile_config = None
-    if hasattr(model, '_is_compiled') and model._is_compiled:
-        compile_config = {
-            'optimizer_config': optimizer_config,
-            'loss': model.loss,
-            'metrics': [m.name if hasattr(m, 'name') else m for m in model.metrics],
-            'weighted_metrics': model.weighted_metrics,
-            'loss_weights': model.loss_weights,
-        }
-        
-        # Add any other necessary compile information
-        if hasattr(model, 'sample_weight_mode'):
-            compile_config['sample_weight_mode'] = model.sample_weight_mode
-        if hasattr(model, 'target_tensors'):
-            compile_config['target_tensors'] = model.target_tensors
+    try:
+        if hasattr(model, '_compile_config'):
+            compile_config = model._compile_config
+        elif hasattr(model, 'get_compile_config'):
+            compile_config = model.get_compile_config()
+    except Exception as e:
+        print(f"Warning: Could not extract compile config: {e}")
     
-    # Call the storage manager to save the checkpoint
+    # Create metadata
+    metadata = {
+        'name': name or f"checkpoint_{step}",
+        'description': description or f"Model checkpoint at step {step}",
+        'step': step,
+        'timestamp': datetime.now().isoformat(),
+        'model_class': model.__class__.__name__,
+        'total_params': model.count_params() if hasattr(model, 'count_params') else 0,
+        'trainable_params': sum(1 for layer in model.layers for weight in layer.trainable_weights),
+        'layers_count': len(model.layers),
+        'framework': 'tensorflow',
+        'framework_version': tf.__version__,
+    }
+    
+    # Save checkpoint using storage manager
     checkpoint_id = storage_manager.save_checkpoint(
         weights_data=weights_data,
         weights_names=weights_names,
@@ -106,23 +124,23 @@ def save_checkpoint(
         optimizer_config=optimizer_config,
         compile_config=compile_config,
         metadata=metadata,
-        step=current_step,
+        step=step
     )
     
-    # Create a Git-like tag if requested and supported
+    # Create tag if requested
     if create_tag and hasattr(storage_manager, 'create_tag'):
+        tag = tag_name or f"checkpoint_{step}"
         try:
-            final_tag_name = tag_name or checkpoint_name
-            storage_manager.create_tag(final_tag_name, checkpoint_id)
-            print(f"Created tag '{final_tag_name}' for checkpoint")
+            storage_manager.create_tag(tag, checkpoint_id)
+            print(f"✓ Created tag: {tag}")
         except Exception as e:
-            print(f"Warning: Could not create tag for checkpoint: {e}")
+            print(f"Warning: Could not create tag {tag}: {e}")
     
     return checkpoint_id
 
 
 def load_checkpoint(
-    model: tf.keras.Model,
+    model: Any,  # Changed from tf.keras.Model to Any for compatibility
     storage_manager: StorageInterface,
     checkpoint_id: str = None,
     step: int = None,
@@ -132,150 +150,185 @@ def load_checkpoint(
     strict: bool = True,
 ) -> Dict[str, Any]:
     """
-    Load a checkpoint into a model.
+    Load a model checkpoint.
     
     Args:
-        model: TensorFlow model to load weights into
+        model: Model to load checkpoint into (TensorFlow model if TF is available)
         storage_manager: Storage manager instance
-        checkpoint_id: ID of the checkpoint to load (ignored if step is provided)
-        step: Step number to load (if provided, loads the checkpoint from this step)
-        by_name: Whether to load weights by name instead of order
-        include_optimizer: Whether to load optimizer state if available
-        recompile: Whether to recompile the model with saved compile config
-        strict: Whether to enforce strict loading (fail on mismatches)
+        checkpoint_id: Checkpoint ID to load
+        step: Step number to load (alternative to checkpoint_id)
+        by_name: Load weights by layer name matching
+        include_optimizer: Whether to restore optimizer state
+        recompile: Whether to recompile the model
+        strict: Whether to enforce strict loading
         
     Returns:
-        Dictionary with metadata about the loaded checkpoint
+        Dictionary with loading information
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
+    if not HAS_TENSORFLOW:
+        require_tensorflow()  # This will raise the appropriate error
+    
+    # Verify model is TensorFlow model
+    if not isinstance(model, tf.keras.Model):
+        raise ValueError("Model must be a TensorFlow/Keras model when TensorFlow is available")
+    
     # Determine which checkpoint to load
-    if step is not None:
+    if checkpoint_id is None and step is not None:
         checkpoint_data = storage_manager.load_checkpoint_by_step(step)
     elif checkpoint_id is not None:
         checkpoint_data = storage_manager.load_checkpoint(checkpoint_id)
     else:
-        # Load the latest checkpoint if neither is specified
         checkpoint_data = storage_manager.load_latest_checkpoint()
     
-    if checkpoint_data is None:
-        raise ValueError("No checkpoint found")
-    
     # Extract checkpoint data
-    weights_data = checkpoint_data.get('weights_data', [])
-    weights_names = checkpoint_data.get('weights_names', [])
-    optimizer_data = checkpoint_data.get('optimizer_data', [])
-    optimizer_config = checkpoint_data.get('optimizer_config', None)
-    compile_config = checkpoint_data.get('compile_config', None)
-    metadata = checkpoint_data.get('metadata', {})
+    weights_data = checkpoint_data["weights_data"]
+    weights_names = checkpoint_data["weights_names"]
+    weights_shapes = checkpoint_data["weights_shapes"]
+    optimizer_data = checkpoint_data.get("optimizer_data", [])
+    optimizer_config = checkpoint_data.get("optimizer_config")
+    compile_config = checkpoint_data.get("compile_config")
+    metadata = checkpoint_data.get("metadata", {})
     
-    # Validate model compatibility if strict mode
-    if strict and 'model_summary' in metadata:
-        current_summary = _get_model_summary(model)
-        if current_summary != metadata['model_summary']:
-            print(f"Warning: Model architecture mismatch detected")
-            print(f"Current: {current_summary}")
-            print(f"Checkpoint: {metadata['model_summary']}")
-            if strict:
-                raise ValueError("Model architecture mismatch - use strict=False to force loading")
+    # Load weights into model
+    loaded_weights = 0
+    failed_weights = 0
     
-    # Load weights into the model
     if by_name:
-        # Create a dict mapping names to weights
-        named_weights = {name: weight for name, weight in zip(weights_names, weights_data)}
+        # Load weights by matching layer names
+        weight_dict = dict(zip(weights_names, weights_data))
         
-        # Assign weights by name
         for layer in model.layers:
-            for weight in layer.weights:
-                name = weight.name
-                if name in named_weights:
-                    try:
-                        weight.assign(named_weights[name])
-                    except Exception as e:
-                        print(f"Error assigning weight {name}: {e}")
-                        if strict:
-                            raise
-    else:
-        # Assign weights directly
-        # This assumes the model structure is exactly the same as when saved
-        if len(weights_data) == 0:
-            print("Warning: No weights found in checkpoint")
-        elif len(weights_data) != len(model.weights):
-            print(f"Warning: Checkpoint has {len(weights_data)} weights, but model has {len(model.weights)} weights")
-            if strict:
-                raise ValueError("Weight count mismatch - use by_name=True or strict=False")
-            print("Will attempt to set weights directly from checkpoint data")
-            model.set_weights(weights_data)
-        else:
-            # Assign weights directly when counts match
-            model.set_weights(weights_data)
-    
-    # Load optimizer state if available and requested
-    if include_optimizer and optimizer_data and optimizer_config:
-        if hasattr(model, 'optimizer') and model.optimizer is not None:
-            optimizer = model.optimizer
+            layer_weights = []
+            layer_found = False
             
-            # Check if optimizer class matches
-            if optimizer.__class__.__name__ == optimizer_config.get('name', ''):
-                # Set weights directly if possible
-                if hasattr(optimizer, 'set_weights') and callable(optimizer.set_weights):
-                    try:
-                        optimizer.set_weights(optimizer_data)
-                    except Exception as e:
-                        print(f"Warning: Failed to set optimizer weights: {e}")
-                        
-                # Alternative method: try to set weights one by one
-                elif hasattr(optimizer, 'weights') and len(optimizer.weights) == len(optimizer_data):
-                    for weight, value in zip(optimizer.weights, optimizer_data):
-                        weight.assign(value)
+            for i in range(len(layer.get_weights())):
+                weight_name = f"{layer.name}/weight_{i}"
+                if weight_name in weight_dict:
+                    layer_weights.append(weight_dict[weight_name])
+                    layer_found = True
+                else:
+                    if strict:
+                        raise ValueError(f"Weight {weight_name} not found in checkpoint")
+                    else:
+                        print(f"Warning: Weight {weight_name} not found, skipping")
+                        failed_weights += 1
+                        break
+            
+            if layer_found and len(layer_weights) == len(layer.get_weights()):
+                try:
+                    layer.set_weights(layer_weights)
+                    loaded_weights += len(layer_weights)
+                except Exception as e:
+                    if strict:
+                        raise ValueError(f"Failed to load weights for layer {layer.name}: {e}")
+                    else:
+                        print(f"Warning: Failed to load weights for layer {layer.name}: {e}")
+                        failed_weights += len(layer_weights)
+    else:
+        # Load weights sequentially
+        weight_idx = 0
+        for layer in model.layers:
+            layer_weights = []
+            num_layer_weights = len(layer.get_weights())
+            
+            if weight_idx + num_layer_weights <= len(weights_data):
+                for i in range(num_layer_weights):
+                    layer_weights.append(weights_data[weight_idx + i])
+                
+                try:
+                    layer.set_weights(layer_weights)
+                    loaded_weights += num_layer_weights
+                    weight_idx += num_layer_weights
+                except Exception as e:
+                    if strict:
+                        raise ValueError(f"Failed to load weights for layer {layer.name}: {e}")
+                    else:
+                        print(f"Warning: Failed to load weights for layer {layer.name}: {e}")
+                        failed_weights += num_layer_weights
+                        weight_idx += num_layer_weights
+            else:
+                if strict:
+                    raise ValueError(f"Not enough weights in checkpoint for layer {layer.name}")
+                else:
+                    print(f"Warning: Not enough weights for layer {layer.name}")
+                    failed_weights += num_layer_weights
+                break
+    
+    # Restore optimizer state if requested
+    optimizer_restored = False
+    if include_optimizer and optimizer_data and len(optimizer_data) > 0:
+        if hasattr(model, 'optimizer') and model.optimizer is not None:
+            try:
+                # If optimizer config is available, create new optimizer
+                if optimizer_config:
+                    # Get optimizer class from config
+                    optimizer_class = optimizer_config.get('class_name', 'Adam')
+                    if hasattr(tf.keras.optimizers, optimizer_class):
+                        optimizer_cls = getattr(tf.keras.optimizers, optimizer_class)
+                        new_optimizer = optimizer_cls.from_config(optimizer_config)
+                        model.compile(optimizer=new_optimizer)
+                
+                # Set optimizer weights
+                model.optimizer.set_weights(optimizer_data)
+                optimizer_restored = True
+            except Exception as e:
+                print(f"Warning: Could not restore optimizer state: {e}")
     
     # Recompile model if requested and compile config is available
-    if recompile and compile_config and hasattr(model, 'compile'):
-        # Extract necessary compile parameters
-        optimizer = model.optimizer  # Keep existing optimizer with restored weights
-        loss = compile_config.get('loss')
-        metrics = compile_config.get('metrics', [])
-        loss_weights = compile_config.get('loss_weights')
-        weighted_metrics = compile_config.get('weighted_metrics')
-        
-        # Recompile the model
-        model.compile(
-            optimizer=optimizer,
-            loss=loss,
-            metrics=metrics,
-            loss_weights=loss_weights,
-            weighted_metrics=weighted_metrics
-        )
+    if recompile and compile_config:
+        try:
+            model.compile(**compile_config)
+        except Exception as e:
+            print(f"Warning: Could not recompile model: {e}")
     
-    return metadata
+    return {
+        'checkpoint_id': checkpoint_id or metadata.get('name', 'unknown'),
+        'step': metadata.get('step', 0),
+        'loaded_weights': loaded_weights,
+        'failed_weights': failed_weights,
+        'optimizer_restored': optimizer_restored,
+        'metadata': metadata,
+        'success': failed_weights == 0
+    }
 
 
 def load_checkpoint_from_tag(
-    model: tf.keras.Model,
+    model: Any,  # Changed from tf.keras.Model to Any for compatibility
     storage_manager: StorageInterface,
     tag_name: str,
     **kwargs
 ) -> Dict[str, Any]:
     """
-    Load a checkpoint using a Git-like tag.
+    Load a checkpoint from a tag.
     
     Args:
-        model: TensorFlow model to load weights into
+        model: Model to load checkpoint into (TensorFlow model if TF is available)
         storage_manager: Storage manager instance
-        tag_name: Name of the tag pointing to the checkpoint
+        tag_name: Tag name to load from
         **kwargs: Additional arguments passed to load_checkpoint
         
     Returns:
-        Dictionary with metadata about the loaded checkpoint
+        Dictionary with loading information
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
-    # Resolve tag to snapshot/checkpoint ID
-    if hasattr(storage_manager, 'get_snapshot_id_for_reference'):
-        checkpoint_id = storage_manager.get_snapshot_id_for_reference(tag_name)
-        if not checkpoint_id:
-            raise ValueError(f"Tag '{tag_name}' not found")
-    else:
-        # Fallback: assume tag_name is the checkpoint_id
-        checkpoint_id = tag_name
+    if not HAS_TENSORFLOW:
+        require_tensorflow()  # This will raise the appropriate error
     
-    return load_checkpoint(model, storage_manager, checkpoint_id=checkpoint_id, **kwargs)
+    # Look up the snapshot ID from the tag
+    if hasattr(storage_manager, 'list_tags'):
+        tags = storage_manager.list_tags()
+        if tag_name not in tags:
+            raise ValueError(f"Tag '{tag_name}' not found")
+        
+        snapshot_id = tags[tag_name]
+        return load_checkpoint(model, storage_manager, checkpoint_id=snapshot_id, **kwargs)
+    else:
+        raise NotImplementedError("Storage manager does not support tags")
 
 
 def list_checkpoints(storage_manager: StorageInterface) -> List[Dict[str, Any]]:
@@ -286,15 +339,13 @@ def list_checkpoints(storage_manager: StorageInterface) -> List[Dict[str, Any]]:
         storage_manager: Storage manager instance
         
     Returns:
-        List of dictionaries with checkpoint metadata
+        List of checkpoint metadata
     """
     return storage_manager.list_checkpoints()
 
 
-# Git-aware checkpoint functions
-
 def save_checkpoint_on_branch(
-    model: tf.keras.Model,
+    model: Any,  # Changed from tf.keras.Model to Any for compatibility
     storage_manager: StorageInterface,
     branch_name: str,
     message: str,
@@ -305,66 +356,97 @@ def save_checkpoint_on_branch(
     **kwargs
 ) -> str:
     """
-    Save a checkpoint on a specific branch with git-like commit.
+    Save a checkpoint on a specific branch with git-like semantics.
     
     Args:
-        model: TensorFlow model to save
+        model: Model to save (TensorFlow model if TF is available)
         storage_manager: Storage manager instance
-        branch_name: Branch to save checkpoint on
+        branch_name: Branch to save on
         message: Commit message
-        step: Step number (if None, uses storage manager's current step)
-        author: Author of the checkpoint
-        create_tag: Whether to create a tag for this checkpoint
-        tag_name: Name of the tag (if create_tag is True)
-        **kwargs: Additional arguments for save_checkpoint
+        step: Current training step
+        author: Author name
+        create_tag: Whether to create a tag
+        tag_name: Custom tag name
+        **kwargs: Additional arguments passed to save_checkpoint
         
     Returns:
-        Checkpoint snapshot ID
+        Snapshot ID
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
-    # Switch to the target branch if we have git features
-    if hasattr(storage_manager, 'switch_branch'):
-        storage_manager.switch_branch(branch_name, create_if_missing=True)
+    if not HAS_TENSORFLOW:
+        require_tensorflow()  # This will raise the appropriate error
     
-    # Extract model parameters for git commit
-    from paramlake.utils.model_utils import extract_model_parameters, get_git_commit_metadata
+    # Verify model is TensorFlow model
+    if not isinstance(model, tf.keras.Model):
+        raise ValueError("Model must be a TensorFlow/Keras model when TensorFlow is available")
     
-    model_params = extract_model_parameters(model, include_metadata=False)
-    training_info = {
-        "step": step if step is not None else storage_manager.current_step,
-        "checkpoint_message": message
+    # Check if storage manager supports git-like operations
+    if not hasattr(storage_manager, 'commit_model_state'):
+        raise NotImplementedError("Storage manager does not support git-like operations")
+    
+    # Generate step if not provided
+    if step is None:
+        step = storage_manager.current_step
+    
+    # Extract model parameters
+    model_parameters = {}
+    
+    for layer in model.layers:
+        layer_weights = layer.get_weights()
+        for i, weight in enumerate(layer_weights):
+            param_name = f"{layer.name}/weight_{i}"
+            model_parameters[param_name] = weight
+    
+    # Add optimizer parameters if available
+    if hasattr(model, 'optimizer') and model.optimizer is not None:
+        try:
+            optimizer_weights = model.optimizer.get_weights()
+            for i, weight in enumerate(optimizer_weights):
+                param_name = f"optimizer/weight_{i}"
+                model_parameters[param_name] = weight
+        except Exception as e:
+            print(f"Warning: Could not extract optimizer parameters: {e}")
+    
+    # Create additional metadata
+    additional_metadata = {
+        'step': step,
+        'timestamp': datetime.now().isoformat(),
+        'model_class': model.__class__.__name__,
+        'total_params': model.count_params() if hasattr(model, 'count_params') else 0,
+        'framework': 'tensorflow',
+        'framework_version': tf.__version__,
     }
-    commit_metadata = get_git_commit_metadata(model, training_info=training_info)
     
-    # Commit the model state if git features are available
-    if hasattr(storage_manager, 'commit_model_state'):
-        snapshot_id = storage_manager.commit_model_state(
-            model_parameters=model_params,
-            message=message,
-            branch_name=branch_name,
-            author=author,
-            additional_metadata=commit_metadata
-        )
-        
-        # Create tag if requested
-        if create_tag and hasattr(storage_manager, 'create_tag'):
-            try:
-                final_tag_name = tag_name or f"checkpoint_{step or storage_manager.current_step}"
-                storage_manager.create_tag(final_tag_name, snapshot_id)
-                print(f"Created tag '{final_tag_name}' for checkpoint on branch '{branch_name}'")
-            except Exception as e:
-                print(f"Warning: Could not create tag: {e}")
-        
-        return snapshot_id
-    else:
-        # Fallback to regular checkpoint saving
-        return save_checkpoint(
-            model, storage_manager, step=step, 
-            create_tag=create_tag, tag_name=tag_name, **kwargs
-        )
+    # Add any custom metadata from kwargs
+    for key, value in kwargs.items():
+        if key not in ['include_optimizer', 'name', 'description']:
+            additional_metadata[key] = value
+    
+    # Commit model state to branch
+    snapshot_id = storage_manager.commit_model_state(
+        model_parameters=model_parameters,
+        message=message,
+        branch_name=branch_name,
+        author=author,
+        additional_metadata=additional_metadata
+    )
+    
+    # Create tag if requested
+    if create_tag and hasattr(storage_manager, 'create_tag'):
+        tag = tag_name or f"{branch_name}_{step}"
+        try:
+            storage_manager.create_tag(tag, snapshot_id)
+            print(f"✓ Created tag: {tag}")
+        except Exception as e:
+            print(f"Warning: Could not create tag {tag}: {e}")
+    
+    return snapshot_id
 
 
 def load_checkpoint_from_branch(
-    model: tf.keras.Model,
+    model: Any,  # Changed from tf.keras.Model to Any for compatibility
     storage_manager: StorageInterface,
     branch_name: str,
     snapshot_id: Optional[str] = None,
@@ -374,40 +456,112 @@ def load_checkpoint_from_branch(
     Load a checkpoint from a specific branch.
     
     Args:
-        model: TensorFlow model to load weights into
+        model: Model to load checkpoint into (TensorFlow model if TF is available)
         storage_manager: Storage manager instance
-        branch_name: Branch to load checkpoint from
-        snapshot_id: Specific snapshot ID on the branch (if None, uses latest)
-        **kwargs: Additional arguments for load_checkpoint
+        branch_name: Branch name to load from
+        snapshot_id: Specific snapshot ID (if None, uses branch HEAD)
+        **kwargs: Additional arguments passed to load_checkpoint
         
     Returns:
-        Dictionary with metadata about the loaded checkpoint
+        Dictionary with loading information
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
-    # Get the snapshot ID for the branch
-    if snapshot_id is None and hasattr(storage_manager, 'get_snapshot_id_for_reference'):
-        snapshot_id = storage_manager.get_snapshot_id_for_reference(branch_name)
-        if not snapshot_id:
-            raise ValueError(f"Branch '{branch_name}' not found")
+    if not HAS_TENSORFLOW:
+        require_tensorflow()  # This will raise the appropriate error
     
-    # Load parameters from the snapshot if git features are available
-    if hasattr(storage_manager, 'load_parameters_from_snapshot') and snapshot_id:
-        from paramlake.utils.model_utils import load_model_from_parameters
+    # Check if storage manager supports git-like operations
+    if not hasattr(storage_manager, 'load_parameters_from_snapshot'):
+        raise NotImplementedError("Storage manager does not support git-like operations")
+    
+    # Determine snapshot to load
+    if snapshot_id is None:
+        # Use branch HEAD
+        if hasattr(storage_manager, 'list_branches'):
+            branches = storage_manager.list_branches()
+            if branch_name not in branches:
+                raise ValueError(f"Branch '{branch_name}' not found")
         
-        parameters = storage_manager.load_parameters_from_snapshot(snapshot_id)
-        load_model_from_parameters(model, parameters, strict=kwargs.get('strict', True))
-        
-        # Return metadata
-        return {
-            "branch": branch_name,
-            "snapshot_id": snapshot_id,
-            "loaded_from": "git_snapshot"
-        }
+        # For git-like systems, we'd get the HEAD of the branch
+        # For now, assume the branch name can be used as reference
+        reference = branch_name
     else:
-        # Fallback to regular checkpoint loading
-        if snapshot_id:
-            return load_checkpoint(model, storage_manager, checkpoint_id=snapshot_id, **kwargs)
+        reference = snapshot_id
+    
+    # Load parameters from snapshot
+    try:
+        parameters = storage_manager.load_parameters_from_snapshot(reference)
+    except Exception as e:
+        raise ValueError(f"Could not load parameters from {reference}: {e}")
+    
+    # Load parameters into model
+    loaded_params = 0
+    failed_params = 0
+    
+    # Group parameters by layer
+    layer_params = {}
+    optimizer_params = {}
+    
+    for param_name, param_data in parameters.items():
+        if param_name.startswith("optimizer/"):
+            optimizer_params[param_name] = param_data
         else:
-            return load_checkpoint(model, storage_manager, **kwargs)
+            # Extract layer name
+            if "/" in param_name:
+                layer_name = param_name.split("/")[0]
+                if layer_name not in layer_params:
+                    layer_params[layer_name] = {}
+                layer_params[layer_name][param_name] = param_data
+    
+    # Load layer parameters
+    for layer in model.layers:
+        if layer.name in layer_params:
+            layer_weights = []
+            
+            # Collect weights for this layer in order
+            for i in range(len(layer.get_weights())):
+                weight_name = f"{layer.name}/weight_{i}"
+                if weight_name in layer_params[layer.name]:
+                    layer_weights.append(layer_params[layer.name][weight_name])
+                else:
+                    print(f"Warning: Weight {weight_name} not found in checkpoint")
+                    failed_params += 1
+                    break
+            
+            # Set weights if all were found
+            if len(layer_weights) == len(layer.get_weights()):
+                try:
+                    layer.set_weights(layer_weights)
+                    loaded_params += len(layer_weights)
+                except Exception as e:
+                    print(f"Warning: Failed to load weights for layer {layer.name}: {e}")
+                    failed_params += len(layer_weights)
+    
+    # Load optimizer parameters if available
+    optimizer_restored = False
+    if optimizer_params and hasattr(model, 'optimizer') and model.optimizer is not None:
+        try:
+            optimizer_weights = []
+            for i in range(len(optimizer_params)):
+                weight_name = f"optimizer/weight_{i}"
+                if weight_name in optimizer_params:
+                    optimizer_weights.append(optimizer_params[weight_name])
+            
+            if optimizer_weights:
+                model.optimizer.set_weights(optimizer_weights)
+                optimizer_restored = True
+        except Exception as e:
+            print(f"Warning: Could not restore optimizer state: {e}")
+    
+    return {
+        'branch_name': branch_name,
+        'snapshot_id': snapshot_id or reference,
+        'loaded_params': loaded_params,
+        'failed_params': failed_params,
+        'optimizer_restored': optimizer_restored,
+        'success': failed_params == 0
+    }
 
 
 def create_checkpoint_branch(
@@ -417,43 +571,43 @@ def create_checkpoint_branch(
     from_step: Optional[int] = None
 ) -> str:
     """
-    Create a new branch from a checkpoint for experimental training.
+    Create a new branch for checkpoint management.
     
     Args:
         storage_manager: Storage manager instance
         branch_name: Name of the new branch
-        from_checkpoint: Checkpoint ID to branch from (if None, uses current HEAD)
-        from_step: Step number to branch from (if None, uses current HEAD)
+        from_checkpoint: Checkpoint ID to branch from (optional)
+        from_step: Step number to branch from (optional)
         
     Returns:
-        Snapshot ID of the branch point
+        Snapshot ID of the new branch HEAD
     """
     if not hasattr(storage_manager, 'create_branch'):
-        raise NotImplementedError("Git features not available in this storage manager")
+        raise NotImplementedError("Storage manager does not support branching")
     
-    # Determine the reference to branch from
-    from_reference = None
+    # Determine reference to branch from
+    reference = None
     if from_checkpoint:
-        from_reference = from_checkpoint
+        reference = from_checkpoint
     elif from_step is not None:
-        # Try to find a checkpoint at this step
+        # Find checkpoint at the specified step
         checkpoints = list_checkpoints(storage_manager)
         for checkpoint in checkpoints:
             if checkpoint.get('step') == from_step:
-                from_reference = checkpoint.get('snapshot_id') or checkpoint.get('id')
+                reference = checkpoint.get('id') or checkpoint.get('snapshot_id')
                 break
-        if not from_reference:
+        
+        if reference is None:
             raise ValueError(f"No checkpoint found at step {from_step}")
     
     # Create the branch
-    storage_manager.create_branch(branch_name, from_reference=from_reference)
+    storage_manager.create_branch(branch_name, from_reference=reference)
     
-    # Return the snapshot ID we branched from
-    if from_reference:
-        return from_reference
+    # Return the snapshot ID of the new branch
+    if hasattr(storage_manager, 'get_snapshot_id_for_reference'):
+        return storage_manager.get_snapshot_id_for_reference(branch_name)
     else:
-        # Get current HEAD if no specific reference was used
-        return storage_manager.get_snapshot_id_for_reference("main")
+        return branch_name  # Fallback
 
 
 def compare_checkpoints(
@@ -463,41 +617,74 @@ def compare_checkpoints(
     detailed: bool = False
 ) -> Dict[str, Any]:
     """
-    Compare two checkpoints using git-like diff.
+    Compare two checkpoints and return differences.
     
     Args:
         storage_manager: Storage manager instance
-        checkpoint1: First checkpoint reference (ID, tag, or branch)
-        checkpoint2: Second checkpoint reference (ID, tag, or branch)
+        checkpoint1: First checkpoint ID/reference
+        checkpoint2: Second checkpoint ID/reference
         detailed: Whether to include detailed parameter differences
         
     Returns:
-        Comparison results
+        Dictionary with comparison results
     """
-    if not hasattr(storage_manager, 'diff_snapshots'):
-        raise NotImplementedError("Diff features not available in this storage manager")
-    
-    # Resolve checkpoint references to snapshot IDs
-    if hasattr(storage_manager, 'get_snapshot_id_for_reference'):
-        snap1 = storage_manager.get_snapshot_id_for_reference(checkpoint1)
-        snap2 = storage_manager.get_snapshot_id_for_reference(checkpoint2)
+    if hasattr(storage_manager, 'diff_snapshots'):
+        return storage_manager.diff_snapshots(checkpoint1, checkpoint2)
     else:
-        snap1, snap2 = checkpoint1, checkpoint2
-    
-    # Perform diff
-    diff_result = storage_manager.diff_snapshots(snap1, snap2)
-    
-    if not detailed:
-        # Return simplified summary
-        return {
-            "checkpoint1": checkpoint1,
-            "checkpoint2": checkpoint2,
-            "summary": diff_result.get("summary", {}),
-            "metadata_changes": len(diff_result.get("metadata_changes", {})),
-            "layer_changes": len(diff_result.get("layer_changes", {})),
-        }
-    
-    return diff_result
+        # Fallback comparison by loading both checkpoints
+        try:
+            data1 = storage_manager.load_checkpoint(checkpoint1)
+            data2 = storage_manager.load_checkpoint(checkpoint2)
+            
+            # Compare metadata
+            metadata_diff = {}
+            meta1 = data1.get('metadata', {})
+            meta2 = data2.get('metadata', {})
+            
+            for key in set(meta1.keys()) | set(meta2.keys()):
+                val1 = meta1.get(key)
+                val2 = meta2.get(key)
+                if val1 != val2:
+                    metadata_diff[key] = {'old': val1, 'new': val2}
+            
+            # Compare weights
+            weights1 = data1.get('weights_data', [])
+            weights2 = data2.get('weights_data', [])
+            names1 = data1.get('weights_names', [])
+            names2 = data2.get('weights_names', [])
+            
+            weight_diff = {
+                'weights_count_changed': len(weights1) != len(weights2),
+                'weights_names_changed': names1 != names2,
+            }
+            
+            if detailed and len(weights1) == len(weights2):
+                weight_diff['parameter_changes'] = []
+                for i, (w1, w2) in enumerate(zip(weights1, weights2)):
+                    if not np.array_equal(w1, w2):
+                        weight_diff['parameter_changes'].append({
+                            'index': i,
+                            'name': names1[i] if i < len(names1) else f'weight_{i}',
+                            'shape': w1.shape,
+                            'changed': True
+                        })
+            
+            return {
+                'checkpoint1': checkpoint1,
+                'checkpoint2': checkpoint2,
+                'metadata_changes': metadata_diff,
+                'weight_changes': weight_diff,
+                'summary': {
+                    'has_changes': bool(metadata_diff) or weight_diff.get('weights_count_changed', False) or weight_diff.get('weights_names_changed', False)
+                }
+            }
+            
+        except Exception as e:
+            return {
+                'error': str(e),
+                'checkpoint1': checkpoint1,
+                'checkpoint2': checkpoint2
+            }
 
 
 def get_checkpoint_history(
@@ -506,21 +693,32 @@ def get_checkpoint_history(
     limit: Optional[int] = None
 ) -> List[Dict[str, Any]]:
     """
-    Get the history of checkpoints on a branch.
+    Get checkpoint history for a branch.
     
     Args:
         storage_manager: Storage manager instance
-        branch: Branch name (if None, uses current branch)
-        limit: Maximum number of checkpoints to return
+        branch: Branch name (None for default/main)
+        limit: Maximum number of entries to return
         
     Returns:
         List of checkpoint history entries
     """
-    if not hasattr(storage_manager, 'get_history'):
-        # Fallback to listing regular checkpoints
-        return list_checkpoints(storage_manager)
-    
-    return storage_manager.get_history(reference=branch, limit=limit)
+    if hasattr(storage_manager, 'get_history'):
+        return storage_manager.get_history(reference=branch, limit=limit)
+    else:
+        # Fallback to listing checkpoints
+        checkpoints = list_checkpoints(storage_manager)
+        
+        # Sort by timestamp or step
+        checkpoints.sort(
+            key=lambda c: c.get('timestamp', c.get('step', 0)),
+            reverse=True
+        )
+        
+        if limit:
+            checkpoints = checkpoints[:limit]
+        
+        return checkpoints
 
 
 def merge_checkpoint_branches(
@@ -531,22 +729,22 @@ def merge_checkpoint_branches(
     message: Optional[str] = None
 ) -> str:
     """
-    Merge checkpoints from one branch into another.
+    Merge checkpoint branches.
     
     Args:
         storage_manager: Storage manager instance
-        source_branch: Branch to merge from
-        target_branch: Branch to merge into
+        source_branch: Source branch to merge from
+        target_branch: Target branch to merge into
         strategy: Merge strategy ('auto', 'ours', 'theirs')
-        message: Merge commit message
+        message: Custom merge message
         
     Returns:
-        Snapshot ID of the merge commit
+        Snapshot ID of merge commit
     """
     if not hasattr(storage_manager, 'merge_branches'):
-        raise NotImplementedError("Merge features not available in this storage manager")
+        raise NotImplementedError("Storage manager does not support branch merging")
     
-    merge_message = message or f"Merge checkpoint branch '{source_branch}' into '{target_branch}'"
+    merge_message = message or f"Merge branch '{source_branch}' into '{target_branch}'"
     
     return storage_manager.merge_branches(
         source_branch=source_branch,
@@ -568,13 +766,13 @@ def tag_checkpoint(
     Args:
         storage_manager: Storage manager instance
         tag_name: Name of the tag
-        checkpoint_reference: Checkpoint ID, branch, or other reference
+        checkpoint_reference: Checkpoint ID, branch name, or snapshot ID
         message: Optional tag message
     """
     if not hasattr(storage_manager, 'create_tag'):
-        raise NotImplementedError("Tagging features not available in this storage manager")
+        raise NotImplementedError("Storage manager does not support tagging")
     
-    storage_manager.create_tag(tag_name, checkpoint_reference, message=message)
+    storage_manager.create_tag(tag_name, checkpoint_reference, message)
 
 
 def list_checkpoint_tags(storage_manager: StorageInterface) -> Dict[str, str]:
@@ -587,41 +785,55 @@ def list_checkpoint_tags(storage_manager: StorageInterface) -> Dict[str, str]:
     Returns:
         Dictionary mapping tag names to snapshot IDs
     """
-    if not hasattr(storage_manager, 'list_tags'):
+    if hasattr(storage_manager, 'list_tags'):
+        return storage_manager.list_tags()
+    else:
         return {}
-    
-    return storage_manager.list_tags()
 
 
-def _get_model_summary(model: tf.keras.Model) -> Dict[str, Any]:
+def _get_model_summary(model: Any) -> Dict[str, Any]:
     """
-    Get a summary of the model architecture for compatibility checking.
+    Get a summary of model architecture (TensorFlow-specific).
     
     Args:
-        model: TensorFlow model
+        model: Model to summarize (TensorFlow model if TF is available)
         
     Returns:
-        Dictionary with model summary information
+        Dictionary with model summary
     """
-    try:
-        summary = {
-            "num_layers": len(model.layers),
-            "num_parameters": model.count_params(),
-            "input_shape": model.input_shape if hasattr(model, 'input_shape') else None,
-            "output_shape": model.output_shape if hasattr(model, 'output_shape') else None,
+    if not HAS_TENSORFLOW:
+        return {'error': 'TensorFlow not available'}
+    
+    if not isinstance(model, tf.keras.Model):
+        return {'error': 'Not a TensorFlow model'}
+    
+    summary = {
+        'total_params': model.count_params() if hasattr(model, 'count_params') else 0,
+        'trainable_params': sum(1 for layer in model.layers for weight in layer.trainable_weights),
+        'layers_count': len(model.layers),
+        'model_class': model.__class__.__name__,
+    }
+    
+    # Add layer information
+    layers_info = []
+    for layer in model.layers:
+        layer_info = {
+            'name': layer.name,
+            'class': layer.__class__.__name__,
+            'params': layer.count_params() if hasattr(layer, 'count_params') else 0,
         }
         
-        # Add layer types summary
-        layer_types = {}
-        for layer in model.layers:
-            layer_type = layer.__class__.__name__
-            layer_types[layer_type] = layer_types.get(layer_type, 0) + 1
-        summary["layer_types"] = layer_types
+        # Add input/output shapes if available
+        try:
+            if hasattr(layer, 'input_shape'):
+                layer_info['input_shape'] = layer.input_shape
+            if hasattr(layer, 'output_shape'):
+                layer_info['output_shape'] = layer.output_shape
+        except:
+            pass
         
-        return summary
-    except Exception:
-        # Return minimal summary if detailed extraction fails
-        return {
-            "num_layers": len(model.layers) if hasattr(model, 'layers') else 0,
-            "summary_available": False
-        } 
+        layers_info.append(layer_info)
+    
+    summary['layers'] = layers_info
+    
+    return summary 

@@ -1,429 +1,664 @@
 """
-Shared utility functions for TensorFlow models with git-like version control support.
+Model utility functions for ParamLake.
+
+This module provides utilities for working with models across different frameworks,
+with a focus on TensorFlow/Keras models when available.
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+from datetime import datetime
+import subprocess
+import platform
 
 import numpy as np
-import tensorflow as tf
+
+from paramlake.utils.framework_utils import HAS_TENSORFLOW, require_tensorflow
+
+# Optional TensorFlow import
+if HAS_TENSORFLOW:
+    import tensorflow as tf
+else:
+    tf = None
 
 
-def get_all_layers(model: tf.keras.Model) -> List[tf.keras.layers.Layer]:
+def get_all_layers(model: Any) -> List[Any]:
     """
-    Recursively get all layers in a model, including nested layers.
+    Get all layers from a model, handling nested models.
     
     Args:
-        model: TensorFlow model
+        model: Model to extract layers from (TensorFlow model if TF is available)
         
     Returns:
         List of all layers
-    """
-    all_layers = []
-    
-    for layer in model.layers:
-        all_layers.append(layer)
         
-        # If the layer is a model or sequential, get its layers
-        if isinstance(layer, (tf.keras.Model, tf.keras.Sequential)):
-            all_layers.extend(get_all_layers(layer))
+    Raises:
+        ImportError: If TensorFlow is required but not available
+    """
+    if not HAS_TENSORFLOW:
+        require_tensorflow()
     
-    return all_layers
+    if not isinstance(model, tf.keras.Model):
+        raise ValueError("Model must be a TensorFlow/Keras model when TensorFlow is available")
+    
+    layers = []
+    
+    def _get_layers_recursive(layer_or_model):
+        if hasattr(layer_or_model, 'layers'):
+            # This is a model or a layer with sub-layers
+            for sublayer in layer_or_model.layers:
+                layers.append(sublayer)
+                _get_layers_recursive(sublayer)
+        else:
+            # This is a regular layer
+            layers.append(layer_or_model)
+    
+    _get_layers_recursive(model)
+    return layers
 
 
 def process_tensors_batch(storage, layer_group, tensor_data_pairs, tensor_type, step=None):
     """
-    Process and store multiple tensors in a batch.
+    Process multiple tensors for a layer in batch to improve efficiency.
     
     Args:
         storage: Storage manager instance
         layer_group: Layer group to store tensors in
         tensor_data_pairs: List of (tensor_name, tensor_data) tuples
-        tensor_type: Type of tensor (weights, gradients, activations)
-        step: Current step or epoch (if None, uses storage's internal counter)
-        
-    Returns:
-        Number of tensors successfully stored
+        tensor_type: Type of tensors (weights, gradients, activations)
+        step: Current step
     """
-    successful_writes = 0
-    
-    # Process tensors in a batch
     for tensor_name, tensor_data in tensor_data_pairs:
         try:
-            # Store tensor using storage interface
-            storage.store_tensor(layer_group, tensor_name, tensor_type, tensor_data, step)
-            successful_writes += 1
+            # Convert TensorFlow tensors to numpy if needed
+            if HAS_TENSORFLOW and hasattr(tensor_data, 'numpy'):
+                tensor_data = tensor_data.numpy()
+            elif not isinstance(tensor_data, np.ndarray):
+                tensor_data = np.array(tensor_data)
+            
+            # Store the tensor
+            storage.store_tensor(
+                layer_group=layer_group,
+                tensor_name=tensor_name,
+                tensor_type=tensor_type,
+                tensor_data=tensor_data,
+                step=step
+            )
         except Exception as e:
-            import traceback
-            print(f"Error storing tensor {tensor_name}: {e}")
-            traceback.print_exc()
-    
-    return successful_writes
+            print(f"Error processing tensor {tensor_name}: {e}")
 
 
-def extract_model_parameters(model: tf.keras.Model, include_metadata: bool = True) -> Dict[str, Any]:
+def extract_model_parameters(model: Any, include_metadata: bool = True) -> Dict[str, Any]:
     """
-    Extract model parameters for git-like commits.
+    Extract all parameters from a model for storage.
     
     Args:
-        model: TensorFlow model
+        model: Model to extract parameters from (TensorFlow model if TF is available)
         include_metadata: Whether to include model metadata
         
     Returns:
-        Dictionary with model parameters and optional metadata
-    """
-    # Create a mapping of weight objects to their layer information
-    weight_to_layer = {}
-    for layer in model.layers:
-        for weight in layer.weights:
-            weight_to_layer[id(weight)] = layer.name
-    
-    params = {}
-    for i, weight_var in enumerate(model.weights):
-        # Create unique name using layer name and weight name
-        layer_name = weight_to_layer.get(id(weight_var), f"layer_{i}")
-        weight_name = weight_var.name if weight_var.name else f"weight_{i}"
+        Dictionary with model parameters and optionally metadata
         
-        # Combine layer name and weight name for uniqueness
-        unique_name = f"{layer_name}/{weight_name}"
-        params[unique_name] = weight_var.numpy()
-    
-    if include_metadata:
-        result = {
-            "parameters": params,
-            "metadata": get_model_metadata(model)
-        }
-        return result
-    else:
-        return params
-
-
-def get_model_metadata(model: tf.keras.Model) -> Dict[str, Any]:
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
-    Extract comprehensive model metadata for version control.
+    if not HAS_TENSORFLOW:
+        require_tensorflow()
+    
+    if not isinstance(model, tf.keras.Model):
+        raise ValueError("Model must be a TensorFlow/Keras model when TensorFlow is available")
+    
+    parameters = {}
+    
+    # Extract layer weights
+    for layer in model.layers:
+        layer_weights = layer.get_weights()
+        for i, weight in enumerate(layer_weights):
+            param_name = f"{layer.name}/weight_{i}"
+            parameters[param_name] = weight
+    
+    # Extract optimizer weights if available
+    if hasattr(model, 'optimizer') and model.optimizer is not None:
+        try:
+            optimizer_weights = model.optimizer.get_weights()
+            for i, weight in enumerate(optimizer_weights):
+                param_name = f"optimizer/weight_{i}"
+                parameters[param_name] = weight
+        except Exception as e:
+            print(f"Warning: Could not extract optimizer parameters: {e}")
+    
+    # Include metadata if requested
+    if include_metadata:
+        parameters['_metadata'] = get_model_metadata(model)
+    
+    return parameters
+
+
+def get_model_metadata(model: Any) -> Dict[str, Any]:
+    """
+    Extract metadata from a model.
     
     Args:
-        model: TensorFlow model
+        model: Model to extract metadata from (TensorFlow model if TF is available)
         
     Returns:
         Dictionary with model metadata
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
+    if not HAS_TENSORFLOW:
+        require_tensorflow()
+    
+    if not isinstance(model, tf.keras.Model):
+        raise ValueError("Model must be a TensorFlow/Keras model when TensorFlow is available")
+    
     metadata = {
-        "architecture": {
-            "num_layers": len(model.layers),
-            "layer_types": {},
-            "total_params": model.count_params(),
-            "trainable_params": sum(tf.keras.utils.count_params(w) for w in model.trainable_weights),
-            "non_trainable_params": sum(tf.keras.utils.count_params(w) for w in model.non_trainable_weights),
-        },
-        "compilation": {},
-        "input_output": {},
+        'model_class': model.__class__.__name__,
+        'framework': 'tensorflow',
+        'framework_version': tf.__version__,
+        'total_params': model.count_params() if hasattr(model, 'count_params') else 0,
+        'trainable_params': sum(1 for layer in model.layers for weight in layer.trainable_weights),
+        'layers_count': len(model.layers),
+        'timestamp': datetime.now().isoformat(),
     }
     
-    # Layer type counts
+    # Add layer information
+    layers_info = []
     for layer in model.layers:
-        layer_type = layer.__class__.__name__
-        metadata["architecture"]["layer_types"][layer_type] = metadata["architecture"]["layer_types"].get(layer_type, 0) + 1
-    
-    # Compilation info
-    if hasattr(model, '_is_compiled') and model._is_compiled:
-        metadata["compilation"] = {
-            "optimizer": model.optimizer.__class__.__name__ if model.optimizer else None,
-            "loss": str(model.loss) if model.loss else None,
-            "metrics": [str(m) for m in model.metrics] if model.metrics else [],
+        layer_info = {
+            'name': layer.name,
+            'class': layer.__class__.__name__,
+            'params': layer.count_params() if hasattr(layer, 'count_params') else 0,
+            'trainable': layer.trainable,
         }
         
-        # Optimizer config if available
-        if model.optimizer:
-            try:
-                metadata["compilation"]["optimizer_config"] = model.optimizer.get_config()
-            except:
-                pass
+        # Add shapes if available
+        try:
+            if hasattr(layer, 'input_shape'):
+                layer_info['input_shape'] = layer.input_shape
+            if hasattr(layer, 'output_shape'):
+                layer_info['output_shape'] = layer.output_shape
+        except:
+            pass
+        
+        layers_info.append(layer_info)
     
-    # Input/output shapes
+    metadata['layers'] = layers_info
+    
+    # Add optimizer info if available
+    if hasattr(model, 'optimizer') and model.optimizer is not None:
+        try:
+            optimizer_config = model.optimizer.get_config()
+            metadata['optimizer'] = {
+                'class': model.optimizer.__class__.__name__,
+                'config': optimizer_config
+            }
+        except Exception as e:
+            metadata['optimizer'] = {'error': str(e)}
+    
+    # Add compile info if available
     try:
-        if hasattr(model, 'input_shape'):
-            metadata["input_output"]["input_shape"] = model.input_shape
-        if hasattr(model, 'output_shape'):
-            metadata["input_output"]["output_shape"] = model.output_shape
-    except:
-        pass
+        if hasattr(model, '_compile_config'):
+            metadata['compile_config'] = model._compile_config
+        elif hasattr(model, 'get_compile_config'):
+            metadata['compile_config'] = model.get_compile_config()
+    except Exception as e:
+        metadata['compile_config'] = {'error': str(e)}
     
     return metadata
 
 
-def compare_model_architectures(model1: tf.keras.Model, model2: tf.keras.Model) -> Dict[str, Any]:
+def compare_model_architectures(model1: Any, model2: Any) -> Dict[str, Any]:
     """
-    Compare architectures of two models for diff operations.
+    Compare the architectures of two models.
     
     Args:
-        model1: First model
-        model2: Second model
+        model1: First model (TensorFlow model if TF is available)
+        model2: Second model (TensorFlow model if TF is available)
         
     Returns:
         Dictionary with comparison results
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
+    if not HAS_TENSORFLOW:
+        require_tensorflow()
+    
+    if not isinstance(model1, tf.keras.Model) or not isinstance(model2, tf.keras.Model):
+        raise ValueError("Both models must be TensorFlow/Keras models when TensorFlow is available")
+    
+    comparison = {
+        'identical': True,
+        'differences': [],
+        'summary': {}
+    }
+    
+    # Compare basic metrics
     meta1 = get_model_metadata(model1)
     meta2 = get_model_metadata(model2)
     
-    comparison = {
-        "architectures_identical": True,
-        "parameter_count_diff": meta2["architecture"]["total_params"] - meta1["architecture"]["total_params"],
-        "layer_count_diff": meta2["architecture"]["num_layers"] - meta1["architecture"]["num_layers"],
-        "differences": {},
+    for key in ['total_params', 'trainable_params', 'layers_count']:
+        if meta1[key] != meta2[key]:
+            comparison['identical'] = False
+            comparison['differences'].append({
+                'type': 'basic_metric',
+                'metric': key,
+                'model1': meta1[key],
+                'model2': meta2[key]
+            })
+    
+    # Compare layer by layer
+    layers1 = model1.layers
+    layers2 = model2.layers
+    
+    if len(layers1) != len(layers2):
+        comparison['identical'] = False
+        comparison['differences'].append({
+            'type': 'layer_count',
+            'model1': len(layers1),
+            'model2': len(layers2)
+        })
+    
+    # Compare individual layers
+    min_layers = min(len(layers1), len(layers2))
+    for i in range(min_layers):
+        layer1, layer2 = layers1[i], layers2[i]
+        
+        if layer1.__class__.__name__ != layer2.__class__.__name__:
+            comparison['identical'] = False
+            comparison['differences'].append({
+                'type': 'layer_class',
+                'layer_index': i,
+                'model1': layer1.__class__.__name__,
+                'model2': layer2.__class__.__name__
+            })
+        
+        if layer1.name != layer2.name:
+            comparison['differences'].append({
+                'type': 'layer_name',
+                'layer_index': i,
+                'model1': layer1.name,
+                'model2': layer2.name
+            })
+        
+        # Compare parameter counts
+        params1 = layer1.count_params() if hasattr(layer1, 'count_params') else 0
+        params2 = layer2.count_params() if hasattr(layer2, 'count_params') else 0
+        
+        if params1 != params2:
+            comparison['identical'] = False
+            comparison['differences'].append({
+                'type': 'layer_params',
+                'layer_index': i,
+                'layer_name': layer1.name,
+                'model1': params1,
+                'model2': params2
+            })
+    
+    # Summary
+    comparison['summary'] = {
+        'total_differences': len(comparison['differences']),
+        'models_identical': comparison['identical'],
+        'model1_layers': len(layers1),
+        'model2_layers': len(layers2),
+        'model1_params': meta1['total_params'],
+        'model2_params': meta2['total_params']
     }
-    
-    # Compare layer counts
-    layer_types1 = meta1["architecture"]["layer_types"]
-    layer_types2 = meta2["architecture"]["layer_types"]
-    
-    all_layer_types = set(layer_types1.keys()) | set(layer_types2.keys())
-    for layer_type in all_layer_types:
-        count1 = layer_types1.get(layer_type, 0)
-        count2 = layer_types2.get(layer_type, 0)
-        if count1 != count2:
-            comparison["architectures_identical"] = False
-            comparison["differences"][f"{layer_type}_layers"] = {
-                "model1": count1,
-                "model2": count2,
-                "diff": count2 - count1
-            }
-    
-    # Compare compilation settings
-    comp1 = meta1.get("compilation", {})
-    comp2 = meta2.get("compilation", {})
-    
-    for key in ["optimizer", "loss"]:
-        if comp1.get(key) != comp2.get(key):
-            comparison["architectures_identical"] = False
-            comparison["differences"][key] = {
-                "model1": comp1.get(key),
-                "model2": comp2.get(key)
-            }
     
     return comparison
 
 
 def load_model_from_parameters(
-    model_template: tf.keras.Model, 
+    model_template: Any, 
     parameters: Dict[str, np.ndarray],
     strict: bool = True
-) -> tf.keras.Model:
+) -> Any:
     """
-    Load parameters into a model template for git checkout operations.
+    Load parameters into a model from a parameter dictionary.
     
     Args:
-        model_template: Model to load parameters into
-        parameters: Parameter dictionary from git storage
+        model_template: Template model to load parameters into (TensorFlow model if TF is available)
+        parameters: Dictionary of parameter arrays
         strict: Whether to enforce strict parameter matching
         
     Returns:
         Model with loaded parameters
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
-    # Create mapping from weight objects to their layer information
-    weight_to_layer = {}
-    for layer in model_template.layers:
-        for weight in layer.weights:
-            weight_to_layer[id(weight)] = layer.name
+    if not HAS_TENSORFLOW:
+        require_tensorflow()
     
-    weights_to_set = []
-    found_weights = {}
+    if not isinstance(model_template, tf.keras.Model):
+        raise ValueError("Model template must be a TensorFlow/Keras model when TensorFlow is available")
     
-    # First pass: try exact name matching
-    for i, weight_var in enumerate(model_template.weights):
-        # Recreate the unique name using the same logic as extraction
-        layer_name = weight_to_layer.get(id(weight_var), f"layer_{i}")
-        weight_name = weight_var.name if weight_var.name else f"weight_{i}"
-        unique_name = f"{layer_name}/{weight_name}"
-        
-        # Try to find the parameter with the unique name
-        sanitized_name = unique_name.replace("/", "_").replace(":", "_")
-        
-        param_data = None
-        matched_key = None
-        
-        # Try multiple matching strategies
-        for key_to_try in [unique_name, sanitized_name, weight_var.name]:
-            if key_to_try in parameters:
-                param_data = parameters[key_to_try]
-                matched_key = key_to_try
-                break
-        
-        if param_data is not None:
-            # Verify shapes match to prevent mismatch errors
-            if param_data.shape == weight_var.shape:
-                weights_to_set.append(param_data)
-                found_weights[unique_name] = True
-            else:
-                if strict:
-                    raise ValueError(f"Shape mismatch for {unique_name}. Expected {weight_var.shape}, got {param_data.shape}")
-                else:
-                    print(f"Warning: Shape mismatch for {unique_name}. Using existing weights.")
-                    weights_to_set.append(weight_var.numpy())
+    # Filter out metadata
+    param_dict = {k: v for k, v in parameters.items() if not k.startswith('_')}
+    
+    # Group parameters by layer
+    layer_params = {}
+    optimizer_params = {}
+    
+    for param_name, param_data in param_dict.items():
+        if param_name.startswith("optimizer/"):
+            optimizer_params[param_name] = param_data
         else:
-            if strict:
-                raise ValueError(f"Parameter {unique_name} not found in checkpoint")
-            else:
-                weights_to_set.append(weight_var.numpy())
+            # Extract layer name
+            if "/" in param_name:
+                layer_name = param_name.split("/")[0]
+                if layer_name not in layer_params:
+                    layer_params[layer_name] = {}
+                layer_params[layer_name][param_name] = param_data
     
-    # Set the weights
-    if len(weights_to_set) == len(model_template.weights):
-        model_template.set_weights(weights_to_set)
-    else:
-        raise ValueError(f"Weight count mismatch. Model has {len(model_template.weights)}, checkpoint has {len(weights_to_set)}")
+    # Load layer parameters
+    loaded_count = 0
+    failed_count = 0
+    
+    for layer in model_template.layers:
+        if layer.name in layer_params:
+            layer_weights = []
+            
+            # Collect weights for this layer in order
+            for i in range(len(layer.get_weights())):
+                weight_name = f"{layer.name}/weight_{i}"
+                if weight_name in layer_params[layer.name]:
+                    layer_weights.append(layer_params[layer.name][weight_name])
+                else:
+                    if strict:
+                        raise ValueError(f"Weight {weight_name} not found in parameters")
+                    else:
+                        print(f"Warning: Weight {weight_name} not found")
+                        failed_count += 1
+                        break
+            
+            # Set weights if all were found
+            if len(layer_weights) == len(layer.get_weights()):
+                try:
+                    layer.set_weights(layer_weights)
+                    loaded_count += len(layer_weights)
+                except Exception as e:
+                    if strict:
+                        raise ValueError(f"Failed to load weights for layer {layer.name}: {e}")
+                    else:
+                        print(f"Warning: Failed to load weights for layer {layer.name}: {e}")
+                        failed_count += len(layer_weights)
+    
+    # Load optimizer parameters if available
+    if optimizer_params and hasattr(model_template, 'optimizer') and model_template.optimizer is not None:
+        try:
+            optimizer_weights = []
+            for i in range(len(optimizer_params)):
+                weight_name = f"optimizer/weight_{i}"
+                if weight_name in optimizer_params:
+                    optimizer_weights.append(optimizer_params[weight_name])
+            
+            if optimizer_weights:
+                model_template.optimizer.set_weights(optimizer_weights)
+                print(f"Loaded optimizer parameters: {len(optimizer_weights)} weights")
+        except Exception as e:
+            print(f"Warning: Could not load optimizer parameters: {e}")
+    
+    print(f"Parameter loading complete: {loaded_count} loaded, {failed_count} failed")
     
     return model_template
 
 
 def create_model_diff_summary(
-    model1: tf.keras.Model, 
-    model2: tf.keras.Model,
+    model1: Any, 
+    model2: Any,
     parameter_changes: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Create a comprehensive diff summary between two models.
     
     Args:
-        model1: First model (baseline)
-        model2: Second model (comparison)
-        parameter_changes: Optional parameter change information
+        model1: First model (TensorFlow model if TF is available)
+        model2: Second model (TensorFlow model if TF is available)
+        parameter_changes: Optional pre-computed parameter changes
         
     Returns:
-        Detailed diff summary
+        Dictionary with diff summary
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
-    arch_comparison = compare_model_architectures(model1, model2)
+    if not HAS_TENSORFLOW:
+        require_tensorflow()
     
-    summary = {
-        "architecture_changes": arch_comparison,
-        "parameter_statistics": {},
-        "training_impact": {},
+    if not isinstance(model1, tf.keras.Model) or not isinstance(model2, tf.keras.Model):
+        raise ValueError("Both models must be TensorFlow/Keras models when TensorFlow is available")
+    
+    diff_summary = {
+        'timestamp': datetime.now().isoformat(),
+        'architecture_comparison': compare_model_architectures(model1, model2),
+        'parameter_changes': parameter_changes or {},
+        'statistics': {}
     }
-    
-    if parameter_changes:
-        summary["parameter_changes"] = parameter_changes
     
     # Calculate parameter statistics
     params1 = extract_model_parameters(model1, include_metadata=False)
     params2 = extract_model_parameters(model2, include_metadata=False)
     
-    param_stats = {
-        "total_parameters_changed": 0,
-        "parameter_norm_diff": 0.0,
-        "layer_changes": {}
-    }
+    changed_params = 0
+    total_params = 0
+    param_norm_changes = []
     
     common_params = set(params1.keys()) & set(params2.keys())
+    
     for param_name in common_params:
-        p1 = params1[param_name]
-        p2 = params2[param_name]
+        p1, p2 = params1[param_name], params2[param_name]
+        total_params += 1
         
-        if p1.shape == p2.shape:
-            diff = p2 - p1
-            norm_diff = float(np.linalg.norm(diff))
+        if not np.array_equal(p1, p2):
+            changed_params += 1
+            # Calculate L2 norm of change
+            diff_norm = np.linalg.norm(p2 - p1)
+            param_norm = np.linalg.norm(p1)
+            relative_change = diff_norm / (param_norm + 1e-8)
             
-            if norm_diff > 1e-8:  # Consider changed if difference is significant
-                param_stats["total_parameters_changed"] += 1
-                param_stats["parameter_norm_diff"] += norm_diff
-                
-                layer_name = param_name.split('/')[0]
-                if layer_name not in param_stats["layer_changes"]:
-                    param_stats["layer_changes"][layer_name] = {
-                        "changed_tensors": 0,
-                        "total_norm_diff": 0.0
-                    }
-                param_stats["layer_changes"][layer_name]["changed_tensors"] += 1
-                param_stats["layer_changes"][layer_name]["total_norm_diff"] += norm_diff
+            param_norm_changes.append({
+                'name': param_name,
+                'absolute_change': float(diff_norm),
+                'relative_change': float(relative_change),
+                'param_norm': float(param_norm)
+            })
     
-    summary["parameter_statistics"] = param_stats
+    # Sort by relative change magnitude
+    param_norm_changes.sort(key=lambda x: x['relative_change'], reverse=True)
     
-    return summary
+    diff_summary['statistics'] = {
+        'total_parameters': total_params,
+        'changed_parameters': changed_params,
+        'unchanged_parameters': total_params - changed_params,
+        'change_percentage': (changed_params / max(total_params, 1)) * 100,
+        'top_changes': param_norm_changes[:10],  # Top 10 largest changes
+        'added_parameters': len(set(params2.keys()) - set(params1.keys())),
+        'removed_parameters': len(set(params1.keys()) - set(params2.keys()))
+    }
+    
+    return diff_summary
 
 
 def validate_model_compatibility(
-    model: tf.keras.Model, 
+    model: Any, 
     checkpoint_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Validate if a model is compatible with checkpoint metadata.
+    Validate that a model is compatible with checkpoint metadata.
     
     Args:
-        model: Model to validate
-        checkpoint_metadata: Metadata from checkpoint
+        model: Model to validate (TensorFlow model if TF is available)
+        checkpoint_metadata: Metadata from a checkpoint
         
     Returns:
-        Validation results
+        Dictionary with validation results
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
-    current_meta = get_model_metadata(model)
+    if not HAS_TENSORFLOW:
+        require_tensorflow()
+    
+    if not isinstance(model, tf.keras.Model):
+        raise ValueError("Model must be a TensorFlow/Keras model when TensorFlow is available")
     
     validation = {
-        "compatible": True,
-        "warnings": [],
-        "errors": [],
-        "architecture_match": True,
-        "compilation_match": True,
+        'compatible': True,
+        'warnings': [],
+        'errors': [],
+        'details': {}
     }
     
-    # Check architecture compatibility
-    if "architecture" in checkpoint_metadata:
-        ckpt_arch = checkpoint_metadata["architecture"]
-        curr_arch = current_meta["architecture"]
-        
-        if ckpt_arch.get("num_layers") != curr_arch.get("num_layers"):
-            validation["architecture_match"] = False
-            validation["errors"].append(f"Layer count mismatch: checkpoint has {ckpt_arch.get('num_layers')}, model has {curr_arch.get('num_layers')}")
-        
-        if ckpt_arch.get("total_params") != curr_arch.get("total_params"):
-            validation["architecture_match"] = False
-            validation["errors"].append(f"Parameter count mismatch: checkpoint has {ckpt_arch.get('total_params')}, model has {curr_arch.get('total_params')}")
+    current_metadata = get_model_metadata(model)
     
-    # Check compilation compatibility
-    if "compilation" in checkpoint_metadata:
-        ckpt_comp = checkpoint_metadata["compilation"]
-        curr_comp = current_meta["compilation"]
-        
-        if ckpt_comp.get("optimizer") != curr_comp.get("optimizer"):
-            validation["compilation_match"] = False
-            validation["warnings"].append(f"Optimizer mismatch: checkpoint has {ckpt_comp.get('optimizer')}, model has {curr_comp.get('optimizer')}")
-        
-        if ckpt_comp.get("loss") != curr_comp.get("loss"):
-            validation["compilation_match"] = False
-            validation["warnings"].append(f"Loss function mismatch: checkpoint has {ckpt_comp.get('loss')}, model has {curr_comp.get('loss')}")
+    # Check basic compatibility
+    checks = [
+        ('total_params', 'Total parameter count'),
+        ('layers_count', 'Number of layers'),
+        ('framework', 'Framework'),
+    ]
     
-    # Overall compatibility
-    if validation["errors"]:
-        validation["compatible"] = False
+    for key, description in checks:
+        if key in checkpoint_metadata:
+            current_val = current_metadata.get(key)
+            checkpoint_val = checkpoint_metadata.get(key)
+            
+            if current_val != checkpoint_val:
+                if key in ['total_params', 'layers_count']:
+                    validation['compatible'] = False
+                    validation['errors'].append(
+                        f"{description} mismatch: model has {current_val}, "
+                        f"checkpoint has {checkpoint_val}"
+                    )
+                else:
+                    validation['warnings'].append(
+                        f"{description} mismatch: model has {current_val}, "
+                        f"checkpoint has {checkpoint_val}"
+                    )
+    
+    # Check layer compatibility
+    if 'layers' in checkpoint_metadata:
+        checkpoint_layers = checkpoint_metadata['layers']
+        current_layers = current_metadata['layers']
+        
+        if len(current_layers) != len(checkpoint_layers):
+            validation['compatible'] = False
+            validation['errors'].append(
+                f"Layer count mismatch: model has {len(current_layers)}, "
+                f"checkpoint has {len(checkpoint_layers)}"
+            )
+        else:
+            # Check individual layers
+            for i, (current_layer, checkpoint_layer) in enumerate(zip(current_layers, checkpoint_layers)):
+                if current_layer['class'] != checkpoint_layer['class']:
+                    validation['compatible'] = False
+                    validation['errors'].append(
+                        f"Layer {i} class mismatch: model has {current_layer['class']}, "
+                        f"checkpoint has {checkpoint_layer['class']}"
+                    )
+                
+                if current_layer['params'] != checkpoint_layer['params']:
+                    validation['compatible'] = False
+                    validation['errors'].append(
+                        f"Layer {i} ({current_layer['name']}) parameter count mismatch: "
+                        f"model has {current_layer['params']}, "
+                        f"checkpoint has {checkpoint_layer['params']}"
+                    )
+    
+    # Framework version check
+    if 'framework_version' in checkpoint_metadata:
+        current_version = current_metadata.get('framework_version')
+        checkpoint_version = checkpoint_metadata.get('framework_version')
+        
+        if current_version != checkpoint_version:
+            validation['warnings'].append(
+                f"Framework version mismatch: current {current_version}, "
+                f"checkpoint {checkpoint_version}"
+            )
+    
+    validation['details'] = {
+        'current_metadata': current_metadata,
+        'checkpoint_metadata': checkpoint_metadata,
+        'total_errors': len(validation['errors']),
+        'total_warnings': len(validation['warnings'])
+    }
     
     return validation
 
 
 def get_git_commit_metadata(
-    model: tf.keras.Model,
+    model: Any,
     training_info: Optional[Dict[str, Any]] = None,
     custom_metadata: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Generate comprehensive metadata for git commits.
+    Generate git-style commit metadata for a model.
     
     Args:
-        model: Model being committed
-        training_info: Optional training information (epochs, loss, metrics, etc.)
-        custom_metadata: Optional custom metadata
+        model: Model to generate metadata for (TensorFlow model if TF is available)
+        training_info: Optional training information
+        custom_metadata: Optional custom metadata to include
         
     Returns:
-        Complete metadata for git commit
+        Dictionary with git-style commit metadata
+        
+    Raises:
+        ImportError: If TensorFlow is required but not available
     """
+    if not HAS_TENSORFLOW:
+        require_tensorflow()
+    
+    if not isinstance(model, tf.keras.Model):
+        raise ValueError("Model must be a TensorFlow/Keras model when TensorFlow is available")
+    
     metadata = {
-        "model": get_model_metadata(model),
-        "timestamp": tf.timestamp().numpy().item(),
-        "framework": {
-            "name": "tensorflow",
-            "version": tf.__version__,
+        'timestamp': datetime.now().isoformat(),
+        'model_metadata': get_model_metadata(model),
+        'system_info': {
+            'platform': platform.platform(),
+            'python_version': platform.python_version(),
+            'tensorflow_version': tf.__version__ if HAS_TENSORFLOW else None,
         }
     }
     
-    if training_info:
-        metadata["training"] = training_info
+    # Add git information if available
+    try:
+        git_commit = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], 
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True
+        ).strip()
+        metadata['git_commit'] = git_commit
+        
+        git_branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True
+        ).strip()
+        metadata['git_branch'] = git_branch
+        
+        # Check for uncommitted changes
+        git_status = subprocess.check_output(
+            ['git', 'status', '--porcelain'],
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True
+        )
+        metadata['git_has_uncommitted_changes'] = bool(git_status.strip())
+        
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Git not available or not a git repository
+        metadata['git_commit'] = None
+        metadata['git_branch'] = None
+        metadata['git_has_uncommitted_changes'] = None
     
+    # Add training info if provided
+    if training_info:
+        metadata['training_info'] = training_info
+    
+    # Add custom metadata if provided
     if custom_metadata:
-        metadata["custom"] = custom_metadata
+        metadata['custom'] = custom_metadata
     
     return metadata 
